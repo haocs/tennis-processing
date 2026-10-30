@@ -1,0 +1,18 @@
+External runtime dependencies — publication review
+
+This repository contains this project's processing/integration source and synthetic
+tests only. It does not vendor RallyClip source, pose-model weights, Python wheels,
+or an FFmpeg binary. The installed private runtime is outside this repository.
+
+- setup_runtime.py fetches RallyClip revision
+  8d8dd7a534a5431bb192e18a94eac787a615118f from its upstream GitHub repository.
+- The inspected upstream tree at that revision has no root LICENSE file. This
+  project does not grant a license to that upstream source. Check upstream terms
+  before redistributing it, model artifacts, or a bundled runtime.
+- Model artifacts are downloaded separately and hash-verified by upstream tools.
+  Their terms, and those of inference libraries, are separate from this source.
+- Python packages and the imageio-ffmpeg distribution are installed separately;
+  preserve their applicable notices in any future redistributed runtime.
+- This project's source is public; no open-source license has been selected.
+- No private configuration, NAS hostnames/paths, media, GPS metadata, state,
+  runtime files, credentials, or real screenshots should enter the repository.

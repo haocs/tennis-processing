@@ -1,0 +1,13 @@
+config.json
+config.json.*
+.runtime/
+.state/
+__pycache__/
+.pytest_cache/
+Processing-status.*
+*.mp4
+*.mov
+*.MOV
+*.jpg
+*.log
+*.sqlite3*
