@@ -13,3 +13,5 @@ Processing-status.*
 *.sqlite3*
 
 timings.csv
+api-worker.json
+api-worker.json.*

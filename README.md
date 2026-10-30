@@ -107,3 +107,58 @@ Export a CSV for analysis with:
 The CSV has one row per stage; the total is repeated for context, so do not sum
 the total column across stages. These measurements cover sequential processing;
 parallelism has not been enabled.
+
+## API worker v2
+
+`api_worker.py` is the portable lease-based executor for
+[tennis-processing-server](https://github.com/haocs/tennis-processing-server).
+The old `worker.py` folder-watcher is retained for migration/rollback; never run
+both automatic schedulers over the same recordings.
+
+Copy `api-worker.example.json` to private `api-worker.json`, configure mounted
+storage mappings, server registration token and the existing model runtime. API
+worker storage includes `originals` (read only) and `processing` (write staging),
+not a library publication root. The server alone activates a result. Runtime
+state/checkpoints live in a separate local state directory. A server-owned mirror
+of its small heartbeat snapshot lives on NAS; credentials never enter that mirror.
+
+Mac commands:
+
+```sh
+./workerctl run           # foreground; Ctrl-C stops the local process
+./workerctl start         # login service, keeps the Mac awake while running
+./workerctl status
+./workerctl logs
+./workerctl restart       # refuses active work unless --force is specified
+./workerctl stop
+```
+
+A Windows machine can use the Python entry point and storage mappings, but Windows
+service installation and HDR encoder support are not yet tested/implemented.
+This release remains Mac-first; no Windows-ready claim is made.
+
+Execution stages are acquire_source, verify_source, prepare_proxy, analyze,
+**process**, package_result and upload_result. The process stage renders clips,
+combines and verifies them. Completed stages retain validated local checkpoints;
+algorithm/config/source changes invalidate their fingerprint. Process currently
+resumes at whole-stage boundaries, not individual clips (follow-up).
+
+Dryrun creates real local media and sends findings/timing through the API; it
+uploads no result/media/checkpoint files to NAS. Experiment tasks isolate the same
+executor with parameter changes; training/evaluation executors are future work.
+**P2:** local-media cleanup/retention task, protecting active work. No automatic
+scratch deletion is enabled in the API worker yet.
+
+Original container/stream tags, GPS/altitude, creation time, frame/codec/color
+properties and codec extra data are retained in `original-metadata.json` beside
+normal/experiment results, and locally for dryruns. Source SHA-256 and the untouched
+original remain authoritative. This snapshot is not a lossless substitute for all
+vendor binary metadata. Original Dolby Vision dynamic metadata is not reapplied
+to newly encoded HDR clips; original timing/duration tags are not misrepresented
+as edited clip durations.
+
+Task events use a durable local outbox and monotonic sequences. The server lease
+is authoritative; cached assignments cannot grant ownership. Heartbeats renew the
+lease separately from progress. FFmpeg is stopped if ownership/cancellation fails;
+NAS uploads check ownership between chunks. Completion is persisted locally and
+replayed with an idempotency key after a lost response.

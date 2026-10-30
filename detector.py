@@ -100,6 +100,7 @@ def detect(video, cfg):
         duration = float(stream.duration * stream.time_base)
         width, height = stream.width, stream.height
         for frame in container.decode(stream):
+            if cfg.get("_guard"): cfg["_guard"]()
             result = pose.model.predict(frame.to_ndarray(format="bgr24"), conf=0.30, imgsz=960)[0]
             records.append({"t": float(frame.time), "boxes": result.boxes.xyxy.numpy(), "k": result.keypoints.xy.numpy(), "kc": result.keypoints.conf.numpy()})
             if time.monotonic() - last_log > 30:

@@ -1,0 +1,21 @@
+{
+  "name": "Mac processing worker",
+  "server_url": "http://nas.local:8089",
+  "registration_token": "PRIVATE_SERVER_REGISTRATION_TOKEN",
+  "state_dir": "/path/to/local/worker-state",
+  "storage": {
+    "originals": {"path": "/path/to/mounted/originals"},
+    "processing": {"path": "/path/to/mounted/library/.processing"}
+  },
+  "processor": {
+    "rallyclip_path": "/path/to/installed/RallyClip",
+    "pose_device": "coreml",
+    "target_region": [0, 0, 1, 1],
+    "min_player_height": 0.12,
+    "swing_speed": 2.0,
+    "arm_reach": 0.85,
+    "padding_before": 2.0,
+    "padding_after": 1.5,
+    "merge_gap": 0.5
+  }
+}

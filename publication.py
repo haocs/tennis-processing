@@ -45,9 +45,9 @@ def poster(session, destination):
     from pipeline import probe
     meta = probe(first)
     tone = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=mobius:desat=0.5,zscale=t=bt709:m=bt709:r=tv," if meta["transfer"] in (16, 18) else ""
-    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-                    "-ss", str(min(2, max(0, meta["duration"] / 2))), "-i", str(first), "-frames:v", "1",
-                    "-vf", tone + "scale=960:-2", "-q:v", "3", str(destination)], check=True, timeout=90)
+    from pipeline import run_media
+    run_media(["-ss", str(min(2, max(0, meta["duration"] / 2))), "-i", str(first), "-frames:v", "1",
+                    "-vf", tone + "scale=960:-2", "-q:v", "3", str(destination)], Path(session).parent / "ffmpeg.log", timeout=90)
 
 
 def metadata_for_session(session):

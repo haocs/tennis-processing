@@ -20,6 +20,7 @@ from playback import build_playback
 import re
 
 LOG = logging.getLogger("tennis")
+EXECUTION_GUARD = None
 
 
 def location_metadata(metadata):
@@ -38,6 +39,27 @@ def location_metadata(metadata):
     return point
 
 
+def original_metadata(container):
+    """Keep original tags/stream properties separately from edited media semantics."""
+    import base64
+    streams = []
+    for stream in container.streams:
+        context = stream.codec_context
+        item = {"type": stream.type, "index": stream.index, "metadata": dict(stream.metadata),
+                "time_base": str(stream.time_base), "duration": stream.duration,
+                "codec": getattr(context, "name", None)}
+        for key in ("width", "height", "sample_rate", "channels", "bit_rate", "color_trc", "color_primaries", "colorspace", "color_range"):
+            try:
+                value = getattr(context, key, None)
+                if isinstance(value, (str,int,float,bool)) or value is None: item[key] = value
+            except (AttributeError, ValueError): pass
+        extra = getattr(context, "extradata", None)
+        if extra: item["codec_extradata_base64"] = base64.b64encode(extra).decode("ascii")
+        streams.append(item)
+    return {"container_tags": dict(container.metadata), "streams": streams,
+            "note": "Original metadata snapshot, not rewritten clip metadata. Originals remain the authoritative source, including binary vendor/codec metadata not exposed by this decoder."}
+
+
 def probe(path):
     with av.open(str(path)) as c:
         s = c.streams.video[0]
@@ -45,14 +67,28 @@ def probe(path):
         if duration <= 0:
             raise ValueError("Video has no positive duration")
         next(c.decode(s))
-        return {"duration": duration, "width": s.width, "height": s.height, "fps": float(s.average_rate or 30), "transfer": int(s.codec_context.color_trc), "primaries": int(s.codec_context.color_primaries), "matrix": int(s.codec_context.colorspace), "range": int(s.codec_context.color_range), "pixel_format": s.codec_context.pix_fmt, "audio": bool(c.streams.audio), "location": location_metadata(c.metadata), "recorded_at": c.metadata.get("com.apple.quicktime.creationdate", c.metadata.get("creation_time", ""))}
+        return {"duration": duration, "width": s.width, "height": s.height, "fps": float(s.average_rate or 30), "transfer": int(s.codec_context.color_trc), "primaries": int(s.codec_context.color_primaries), "matrix": int(s.codec_context.colorspace), "range": int(s.codec_context.color_range), "pixel_format": s.codec_context.pix_fmt, "audio": bool(c.streams.audio), "location": location_metadata(c.metadata), "original_metadata": original_metadata(c), "recorded_at": c.metadata.get("com.apple.quicktime.creationdate", c.metadata.get("creation_time", ""))}
 
 
 def run_media(args, log_path, timeout=7200):
     command = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostdin", "-loglevel", "error", "-y"] + list(args)
     with Path(log_path).open("ab") as log:
-        result = subprocess.run(command, stdout=log, stderr=log, timeout=timeout)
-    if result.returncode:
+        with subprocess.Popen(command, stdout=log, stderr=log) as process:
+            started = time.monotonic()
+            try:
+                while True:
+                    if EXECUTION_GUARD: EXECUTION_GUARD()
+                    try:
+                        code = process.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() - started > timeout: raise TimeoutError("Video operation exceeded timeout")
+            except BaseException:
+                process.terminate()
+                try: process.wait(timeout=5)
+                except subprocess.TimeoutExpired: process.kill(); process.wait()
+                raise
+    if code:
         tail = Path(log_path).read_text(errors="replace")[-1500:]
         raise RuntimeError(f"Video processing failed: {tail}")
 
@@ -64,29 +100,32 @@ def verify_video(path, expected, log):
     run_media(["-xerror", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", "-f", "null", "-"], log)
 
 
+def prepare_video(source, scratch, cfg):
+    meta = probe(source)
+    log = Path(scratch) / "ffmpeg.log"
+    tone = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=mobius:desat=0,zscale=t=bt709:m=bt709:r=tv," if meta["transfer"] in (16, 18) else ""
+    proxy = Path(scratch) / "analysis.mp4"
+    # Keep the tested filter order until a separate quality/performance benchmark.
+    run_media(["-xerror", "-i", str(source), "-map", "0:v:0", "-an", "-vf", tone + "scale=w='min(960,iw)':h=-2,fps=8,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", str(proxy)], log)
+    if abs(probe(proxy)["duration"] - meta["duration"]) > 0.5:
+        raise RuntimeError("Source could not be decoded completely")
+    return meta, proxy
+
+
+def analyze_video(proxy, meta, cfg):
+    intervals, analysis = detect(proxy, cfg)
+    if not intervals: raise RuntimeError("No practice motion detected. Original preserved; check camera framing or detector settings.")
+    if analysis["target_visible_fraction"] < 0.10: raise RuntimeError("Near player visible in fewer than 10% of frames; camera profile needs adjustment")
+    return [[a, min(b, meta["duration"])] for a, b in intervals if a < meta["duration"]], analysis
+
+
 def process_video(source, out, cfg, digest, original_name):
-    from worker import atomic_json, sha256
     started = time.monotonic()
     progress(cfg, "Preparing video for analysis", video=original_name)
     out.mkdir(parents=True, exist_ok=True)
-    meta = probe(source)
-    scratch = out.parent
-    log = scratch / "ffmpeg.log"
-    # This pass both validates the original and normalizes rotation/HDR for detection.
-    tone = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=mobius:desat=0,zscale=t=bt709:m=bt709:r=tv," if meta["transfer"] in (16, 18) else ""
-    proxy = scratch / "analysis.mp4"
-    run_media(["-xerror", "-i", str(source), "-map", "0:v:0", "-an", "-vf", tone + "scale=w='min(960,iw)':h=-2,fps=8,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", str(proxy)], log)
-    proxy_meta = probe(proxy)
-    if abs(proxy_meta["duration"] - meta["duration"]) > 0.5:
-        raise RuntimeError("Source could not be decoded completely")
+    meta, proxy = prepare_video(source, out.parent, cfg)
     progress(cfg, "Analyzing player movement")
-    intervals, analysis = detect(proxy, cfg)
-    if not intervals:
-        raise RuntimeError("No practice motion detected. Original preserved; check camera framing or detector settings.")
-    if analysis["target_visible_fraction"] < 0.10:
-        raise RuntimeError("Near player visible in fewer than 10% of frames; camera profile needs adjustment")
-    # Clamp proxy rounding to actual source length.
-    intervals = [[a, min(b, meta["duration"])] for a, b in intervals if a < meta["duration"]]
+    intervals, analysis = analyze_video(proxy, meta, cfg)
     return render_session(source, out, cfg, digest, original_name, intervals, analysis, meta, started)
 
 

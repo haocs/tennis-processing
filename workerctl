@@ -1,0 +1,4 @@
+#!/bin/zsh
+set -e
+APP_DIR="${0:A:h}"
+exec "$APP_DIR/.runtime/venv/bin/python" "$APP_DIR/api_service.py" "$@"

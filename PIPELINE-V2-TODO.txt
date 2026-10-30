@@ -1,0 +1,14 @@
+PROCESSING V2 ROADMAP
+P0: Validate API worker + server migration on real source footage before cutover.
+P1: Windows setup/supervisor and encoder/backend capability checks. Core worker
+    file-reference/lease protocol is portable; native Windows execution is not
+    claimed tested yet. Keep current Mac hardware HDR encoder.
+P1: More granular per-clip checkpoints inside the process stage.
+P1: Operator reconciliation/import of legacy completed tasks and timing evidence.
+P2: Cleanup task/policy for local dryrun media, interrupted task scratch and stale
+    checkpoints. Retention/size thresholds and preview; protect running tasks,
+    leased attempts and their checkpoints. No automatic deletion is enabled yet.
+P2: Experiment executors for reviewed algorithm evaluation/training. The isolated
+    experiment task type currently runs the same pipeline with parameter changes;
+    it does not implement training or claim detector improvement.
+P2: Bounded compute/transfer concurrency, after measured baseline and resource tests.
