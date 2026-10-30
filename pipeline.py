@@ -39,7 +39,7 @@ def location_metadata(metadata):
     return point
 
 
-def original_metadata(container):
+def original_metadata(container, first_frame=None):
     """Keep original tags/stream properties separately from edited media semantics."""
     import base64
     streams = []
@@ -56,7 +56,14 @@ def original_metadata(container):
         extra = getattr(context, "extradata", None)
         if extra: item["codec_extradata_base64"] = base64.b64encode(extra).decode("ascii")
         streams.append(item)
+    frame_data = []
+    if first_frame is not None:
+        for side in first_frame.side_data.values():
+            try:
+                frame_data.append({"type":str(side.type),"base64":base64.b64encode(bytes(side)).decode("ascii")})
+            except (TypeError, ValueError): pass
     return {"container_tags": dict(container.metadata), "streams": streams,
+            "rotation_degrees": getattr(first_frame,"rotation",None), "first_frame_side_data":frame_data,
             "note": "Original metadata snapshot, not rewritten clip metadata. Originals remain the authoritative source, including binary vendor/codec metadata not exposed by this decoder."}
 
 
@@ -66,8 +73,8 @@ def probe(path):
         duration = float(s.duration * s.time_base) if s.duration is not None else float(c.duration / av.time_base)
         if duration <= 0:
             raise ValueError("Video has no positive duration")
-        next(c.decode(s))
-        return {"duration": duration, "width": s.width, "height": s.height, "fps": float(s.average_rate or 30), "transfer": int(s.codec_context.color_trc), "primaries": int(s.codec_context.color_primaries), "matrix": int(s.codec_context.colorspace), "range": int(s.codec_context.color_range), "pixel_format": s.codec_context.pix_fmt, "audio": bool(c.streams.audio), "location": location_metadata(c.metadata), "original_metadata": original_metadata(c), "recorded_at": c.metadata.get("com.apple.quicktime.creationdate", c.metadata.get("creation_time", ""))}
+        first_frame = next(c.decode(s))
+        return {"duration": duration, "width": s.width, "height": s.height, "fps": float(s.average_rate or 30), "transfer": int(s.codec_context.color_trc), "primaries": int(s.codec_context.color_primaries), "matrix": int(s.codec_context.colorspace), "range": int(s.codec_context.color_range), "pixel_format": s.codec_context.pix_fmt, "audio": bool(c.streams.audio), "location": location_metadata(c.metadata), "original_metadata": original_metadata(c, first_frame), "recorded_at": c.metadata.get("com.apple.quicktime.creationdate", c.metadata.get("creation_time", ""))}
 
 
 def run_media(args, log_path, timeout=7200):

@@ -32,3 +32,14 @@ def test_original_metadata_sidecar_contains_source_tags(tmp_path):
     assert meta['container_tags']['make']=='Apple'
     assert meta['streams'][0]['metadata']['rotate']=='90'
     assert meta['streams'][0]['color_trc']==18
+
+
+def test_rotation_and_binary_source_side_data_are_preserved():
+    import base64
+    from pipeline import original_metadata
+    class Side(bytes): type='DISPLAYMATRIX'
+    class Frame: rotation=90;side_data={'matrix':Side(b'original-matrix')}
+    class Container: metadata={};streams=[]
+    metadata=original_metadata(Container(),Frame())
+    assert metadata['rotation_degrees']==90
+    assert base64.b64decode(metadata['first_frame_side_data'][0]['base64'])==b'original-matrix'
