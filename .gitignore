@@ -11,3 +11,5 @@ Processing-status.*
 *.jpg
 *.log
 *.sqlite3*
+
+timings.csv

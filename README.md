@@ -76,3 +76,34 @@ Migrate all completed sessions before `configure`; the command refuses missing p
 The current activity detector estimates near-player arm motion. It can retain downtime/gestures and miss slow or occluded strokes; preserve originals. Feedback-based detector improvement is a separate future project. Unsupported HDR tags or failed export validation raise an error rather than silently publishing an empty/broken session.
 
 The companion viewing application is [tennis-web](https://github.com/haocs/tennis-web). Cut-quality feedback and algorithm experiments are planned separately.
+
+## Permanent processing timings
+
+Each processing attempt writes `.state/timings/<attempt-id>.json`, including UTC
+start/finish, monotonic wall-clock total, per-stage durations, outcome, source
+identity and available source duration/resolution/frame rate. Retry attempts are
+retained separately. Total includes copying, hashing, preparation, detection,
+export, verification, NAS publication and scratch cleanup. It excludes writing
+the timing report itself. Repeated progress updates do not reset a stage timer.
+
+Observed-to-start time is separate: it includes upload-settling checks, queue wait
+and retry backoff. It is measured since the latest observed source signature,
+not from the iPhone recording or upload start. A forced kill/power loss can prevent
+the current attempt's final report; older completed attempts remain intact.
+
+Once a digest is known, reports are also mirrored best-effort to
+`<library>/metadata/processing/<source-sha256>/<attempt-id>.json`, outside the
+checksummed media. A mirror failure retains the Mac report and does not fail an
+otherwise successful video job. Reports contain filenames, not original paths,
+GPS coordinates or raw exception messages. Legacy non-library deployments retain
+reports locally. No historical timings are invented for older recordings.
+
+Export a CSV for analysis with:
+
+```sh
+./tennisctl timings > timings.csv
+```
+
+The CSV has one row per stage; the total is repeated for context, so do not sum
+the total column across stages. These measurements cover sequential processing;
+parallelism has not been enabled.

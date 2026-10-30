@@ -157,6 +157,23 @@ def publish(local, root, name, digest):
 
 
 def process_source(cfg, source, row, db):
+    from timings import JobTiming, save_report
+    cfg = dict(cfg)  # Per-job instrumentation must not leak into later scans.
+    timing = cfg["_timing"] = JobTiming(source.name, row["stable_since"], row["attempts"] + 1)
+    status = "failed"
+    try:
+        result = _process_source(cfg, source, row, db)
+        status = "done"
+        return result
+    finally:
+        try:
+            save_report(cfg, timing, status)
+        except Exception:
+            # Diagnostics must never turn a committed publication into a retry.
+            LOG.exception("Could not save processing timing report")
+
+
+def _process_source(cfg, source, row, db):
     from pipeline import process_video
     root = check_storage(cfg)
     if cfg.get("library_root"):
@@ -179,19 +196,26 @@ def process_source(cfg, source, row, db):
         if stamp(source) != before:
             raise RuntimeError("Source changed while copying; retrying after upload")
         digest = sha256(local)
+        cfg["_timing"].digest = digest
         progress(cfg, "Checking for an existing result")
         known = db.execute("SELECT output FROM jobs WHERE digest=?", (digest,)).fetchone()
         if known and validate_publication(Path(known["output"]), digest):
+            cfg["_timing"].reused = True
             output = Path(known["output"])
         else:
             safe_stem = re.sub(r"[^\w.-]+", "_", source.stem)[:90]
             name = f"{safe_stem}--{digest[:12]}"
             existing = (Path(cfg["library_root"]) / "media" / digest) if cfg.get("library_root") else root / "Processed" / name
             if validate_publication(existing, digest):
+                cfg["_timing"].reused = True
                 output = existing  # Recover publication completed before a crash.
             else:
                 local_out = scratch / "result"
-                process_video(local, local_out, cfg, digest, str(source.relative_to(root)))
+                report = process_video(local, local_out, cfg, digest, str(source.relative_to(root)))
+                if report:
+                    meta = report.get("source_metadata", {})
+                    cfg["_timing"].info = {k: meta[k] for k in ("duration", "width", "height", "fps", "transfer") if k in meta}
+                    cfg["_timing"].info["clips"] = report.get("clips")
                 progress(cfg, "Verifying original on NAS")
                 if stamp(source) != before or sha256(source) != digest:
                     raise RuntimeError("Source changed during analysis; results not published")
@@ -208,6 +232,7 @@ def process_source(cfg, source, row, db):
         db.commit()
         LOG.info("Completed %s → %s", source.name, output)
     finally:
+        progress(cfg, "Cleaning local scratch")
         shutil.rmtree(scratch, ignore_errors=True)
 
 

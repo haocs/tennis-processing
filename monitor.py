@@ -144,6 +144,9 @@ class Monitor:
 
 
 def progress(cfg, stage, current=None, total=None, unit=None, video=None):
+    timing = cfg.get("_timing")
+    if timing:
+        timing.transition(stage)
     monitor = cfg.get("_monitor")
     if monitor:
         monitor.stage(stage, current, total, unit, video)

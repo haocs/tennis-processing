@@ -40,7 +40,7 @@ def mark_stopped(cfg, python):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action', choices=['start', 'run', 'install', 'stop', 'restart', 'status', 'logs', 'retry'])
+    p.add_argument('action', choices=['start', 'run', 'install', 'stop', 'restart', 'status', 'logs', 'retry', 'timings'])
     p.add_argument('--force', action='store_true', help='Allow restart to interrupt an active job; it retries from the beginning')
     p.add_argument('--follow', '-f', action='store_true', help='Follow logs until Ctrl-C')
     args = p.parse_args(argv)
@@ -51,6 +51,10 @@ def main(argv=None):
     state.mkdir(exist_ok=True)
     cfg = json.loads((ROOT / 'config.json').read_text())
     action = 'start' if args.action in {'run', 'install'} else args.action
+    if action == 'timings':
+        from timings import print_summary
+        print_summary(cfg)
+        return 0
     if action == 'status':
         result = loaded(domain)
         label = 'running' if result.returncode == 0 and 'state = running' in result.stdout else 'registered; waiting/restarting' if result.returncode == 0 else 'stopped'
