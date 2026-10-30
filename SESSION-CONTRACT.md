@@ -26,3 +26,7 @@ A boundary change creates a new clip ID. Website state keeps previous IDs for fu
 Media and processing metadata are read-only from the website. Likes, overrides, and future feedback belong in the separate website database. Store source and algorithm identities alongside future feedback so it can be traced back to the exact cut.
 
 Supported transport today is a filesystem mounted outside the application, optionally expressed as a local `file://` URL. Storage adapters can add other transports later without coupling the UI to Synology. Raw SMB URLs, HTTP catalogs, and object-storage providers are not currently implemented.
+
+Original iPhone location metadata retains latitude, longitude, and optional
+`altitude_m` when present. The website owns saved court names and matching rules;
+those do not rename original recordings or rewrite video media.

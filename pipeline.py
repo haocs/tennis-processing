@@ -4,6 +4,7 @@ import csv
 import html
 import json
 import logging
+import math
 from pathlib import Path
 import subprocess
 import time
@@ -29,7 +30,12 @@ def location_metadata(metadata):
     latitude, longitude = float(match[1]), float(match[2])
     if not -90 <= latitude <= 90 or not -180 <= longitude <= 180:
         return None
-    return {"latitude": latitude, "longitude": longitude}
+    point = {"latitude": latitude, "longitude": longitude}
+    if match[3] is not None:
+        altitude = float(match[3])
+        if math.isfinite(altitude):
+            point["altitude_m"] = altitude
+    return point
 
 
 def probe(path):

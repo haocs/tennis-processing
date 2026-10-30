@@ -13,7 +13,8 @@ import worker
 
 
 def test_iphone_location_is_extracted_without_guessing():
-    assert location_metadata({'com.apple.quicktime.location.ISO6709':'+12.3456-045.6789+001.000/'})=={'latitude':12.3456,'longitude':-45.6789}
+    assert location_metadata({'com.apple.quicktime.location.ISO6709':'+12.3456-045.6789+001.000/'})=={'latitude':12.3456,'longitude':-45.6789,'altitude_m':1.0}
+    assert location_metadata({'com.apple.quicktime.location.ISO6709':'+12.3456-045.6789/'})=={'latitude':12.3456,'longitude':-45.6789}
     assert location_metadata({}) is None
     assert location_metadata({'com.apple.quicktime.location.ISO6709':'+999.0-122.0/'}) is None
 

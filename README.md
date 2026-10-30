@@ -49,7 +49,7 @@ Files must remain unchanged across scans for three minutes. Jobs run one at a ti
 
 ## Output and status
 
-See [session contract](SESSION-CONTRACT.md). The shared library separates `media/` from `metadata/`; the website owns its own state volume. Metadata includes recording timestamp/GPS when present, original cut/preserved intervals, measured clip durations, stable identities, algorithm version, and chapters aligned against actual combined-video keyframe timestamps.
+See [session contract](SESSION-CONTRACT.md). The shared library separates `media/` from `metadata/`; the website owns its own state volume. Metadata includes recording timestamp/GPS (including optional altitude in metres) when present, original cut/preserved intervals, measured clip durations, stable identities, algorithm version, and chapters aligned against actual combined-video keyframe timestamps.
 
 Heartbeat files update locally every 15 seconds and on shared storage roughly every 30 seconds. A heartbeat older than two minutes is stale. A live heartbeat does not prove an operation is progressing; long-operation progress time is shown separately. Shared status omits private input/output paths and raw error details. Detailed errors remain in local processor logs.
 
