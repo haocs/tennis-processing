@@ -49,7 +49,8 @@ def build(config):
     # Python/config updates do not require recompiling an unchanged native wrapper.
     swift=ROOT/'mac_worker.swift'
     if not binary.exists() or binary.stat().st_mtime < swift.stat().st_mtime:
-        subprocess.run(['xcrun','swiftc','-target',platform.machine()+'-apple-macos14.0',str(swift),'-framework','AppKit','-o',str(temporary)],check=True)
+        sdk=subprocess.check_output(['xcrun','--sdk','macosx','--show-sdk-path'],text=True).strip()
+        subprocess.run(['xcrun','swiftc','-sdk',sdk,'-target',platform.machine()+'-apple-macos14.0',str(swift),'-framework','AppKit','-o',str(temporary)],check=True)
         os.replace(temporary,binary)
     subprocess.run(['codesign','--force','--sign','-','--identifier','io.haocs.tennis-worker',str(app)],check=True)
     return binary
