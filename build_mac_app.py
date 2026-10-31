@@ -46,8 +46,11 @@ def build(config):
     launch={'python':str(python),'python_home':runtime['base'],'site_packages':str(packages),'script':str(code/'api_worker.py'),'config':str(private),'directory':str(support)}
     (contents/'Resources/worker-launch.json').write_text(json.dumps(launch))
     binary=contents/'MacOS/TennisWorker';temporary=binary.with_suffix('.new')
-    subprocess.run(['xcrun','swiftc','-target',platform.machine()+'-apple-macos14.0',str(ROOT/'mac_worker.swift'),'-framework','AppKit','-o',str(temporary)],check=True)
-    os.replace(temporary,binary)
+    # Python/config updates do not require recompiling an unchanged native wrapper.
+    swift=ROOT/'mac_worker.swift'
+    if not binary.exists() or binary.stat().st_mtime < swift.stat().st_mtime:
+        subprocess.run(['xcrun','swiftc','-target',platform.machine()+'-apple-macos14.0',str(swift),'-framework','AppKit','-o',str(temporary)],check=True)
+        os.replace(temporary,binary)
     subprocess.run(['codesign','--force','--sign','-','--identifier','io.haocs.tennis-worker',str(app)],check=True)
     return binary
 
