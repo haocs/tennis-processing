@@ -45,7 +45,7 @@ def main():
         from build_mac_app import build
         executable=build(cfg_path)
         cfg=json.loads(cfg_path.read_text());state=Path(cfg['state_dir'])
-        value={'Label':LABEL,'ProgramArguments':[str(executable)],'WorkingDirectory':str(state.parent),'RunAtLoad':True,'KeepAlive':True,'ThrottleInterval':30,'ProcessType':'Background','Nice':10,'StandardOutPath':str(state/'service.log'),'StandardErrorPath':str(state/'service.log')}
+        value={'Label':LABEL,'ProgramArguments':[str(executable)],'WorkingDirectory':str(state.parent),'RunAtLoad':True,'KeepAlive':True,'ThrottleInterval':30,'ProcessType':'Standard','StandardOutPath':str(state/'service.log'),'StandardErrorPath':str(state/'service.log')}
         plist.parent.mkdir(parents=True,exist_ok=True);plist.write_bytes(plistlib.dumps(value))
         subprocess.run(['launchctl','bootstrap',domain,str(plist)],check=True)
         print('API worker enabled; server controls task assignment')
