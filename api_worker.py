@@ -49,6 +49,12 @@ class API:
             raise APIError(exc.code,exc.read().decode()[:500]) from exc
 
 
+def matches_signature(stat, expected):
+    # SMB/Windows can round sub-microsecond timestamps differently from the NAS
+    # host. Content hashes remain authoritative; allow only 1 ms stat rounding.
+    return stat.st_size==expected['bytes'] and abs(stat.st_mtime_ns-expected['modified_ns'])<=1_000_000
+
+
 class LeaseLost(RuntimeError): pass
 class Cancelled(RuntimeError): pass
 
@@ -183,7 +189,7 @@ class Agent:
             stage('acquire_source',acquire,lambda:[local])
             def verify():
                 stat=source.stat()
-                if stat.st_size!=input_ref['bytes'] or stat.st_mtime_ns!=input_ref['modified_ns']: raise ValueError('source_changed')
+                if not matches_signature(stat,input_ref): raise ValueError('source_changed')
                 value=checksum(local)
                 if input_ref.get('sha256') and value!=input_ref['sha256']: raise ValueError('source_hash_mismatch')
                 return value
@@ -215,7 +221,7 @@ class Agent:
                 public['media_checksums']={p.relative_to(media).as_posix():checksum(p) for p in media.rglob('*') if p.is_file()}
                 public['metadata_checksums']={p.name:checksum(p) for p in metadata.iterdir() if p.is_file()}
                 original=source.stat()
-                if original.st_size!=input_ref['bytes'] or original.st_mtime_ns!=input_ref['modified_ns'] or checksum(source)!=digest: raise ValueError('source_changed')
+                if not matches_signature(original,input_ref) or checksum(source)!=digest: raise ValueError('source_changed')
                 atomic(bundle/'result.json',{'schema_version':1,'task_id':task['id'],'attempt_id':attempt['id'],'source_sha256':digest,'session':public,'parameters':task.get('parameters',{}),'pipeline_version':'2.0.0','runtime':self.runtime,'files':[{'path':p.relative_to(bundle).as_posix(),'bytes':p.stat().st_size,'sha256':checksum(p)} for p in bundle.rglob('*') if p.is_file()]})
                 return {'clips':report['clips'],'kept_seconds':report['kept_seconds']}
             # Attempt IDs differ after retries; always refresh manifest packaging.

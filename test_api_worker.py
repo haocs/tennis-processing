@@ -43,3 +43,12 @@ def test_rotation_and_binary_source_side_data_are_preserved():
     metadata=original_metadata(Container(),Frame())
     assert metadata['rotation_degrees']==90
     assert base64.b64decode(metadata['first_frame_side_data'][0]['base64'])==b'original-matrix'
+
+
+def test_smb_timestamp_rounding_does_not_reject_unchanged_source():
+    from types import SimpleNamespace
+    from api_worker import matches_signature
+    expected={'bytes':100,'modified_ns':1_000_000_123}
+    assert matches_signature(SimpleNamespace(st_size=100,st_mtime_ns=1_000_000_100),expected)
+    assert not matches_signature(SimpleNamespace(st_size=101,st_mtime_ns=1_000_000_100),expected)
+    assert not matches_signature(SimpleNamespace(st_size=100,st_mtime_ns=1_010_000_100),expected)
