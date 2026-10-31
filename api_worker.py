@@ -1,6 +1,8 @@
 """Portable API worker. Local state is a cache; the server owns leases/history."""
 from __future__ import annotations
 import argparse
+import sys
+import subprocess
 import contextlib
 import hashlib
 import json
@@ -78,6 +80,16 @@ class Agent:
 
     def ref(self,ref):
         spec=self.config['storage'][ref['storage_id']];root=Path(spec['path']).resolve()
+        marker=root/spec.get('marker','.tennis-storage-id')
+        if spec.get('smb_url') and sys.platform=='darwin' and not marker.is_file():
+            # Reconnect only configured, credential-free SMB locations. macOS uses
+            # its existing authenticated session / saved credentials, never prompts.
+            url=spec['smb_url']
+            if not url.startswith('//') or ':' in url.split('/',3)[2]:
+                raise ValueError('invalid_smb_url')
+            root.mkdir(parents=True,exist_ok=True)
+            subprocess.run(['/sbin/mount_smbfs','-N',url,str(root)],check=True,
+                           capture_output=True,timeout=30)
         if not root.is_dir(): raise OSError('storage_unavailable')
         if spec.get('identity') and (root/spec.get('marker','.tennis-storage-id')).read_text().strip()!=spec['identity']: raise OSError('storage_identity_mismatch')
         relative=ref['path']
@@ -308,13 +320,39 @@ def worker_lock(path):
                 stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_UNLCK,1)
 
 
+def run_supervised(config, once=False, sleep=time.sleep):
+    # A short-lived launch agent can disappear before macOS displays its local
+    # network permission alert. Keep the process alive and recover on reconnect.
+    while True:
+        try:
+            Agent(config).run(once)
+            return
+        except OSError:
+            if once: raise
+            LOG.warning('Server connection unavailable; keeping worker alive and retrying in 15 seconds')
+            sleep(15)
+
+
+@contextlib.contextmanager
+def prevent_idle_sleep():
+    # Keep Python as the launch agent's responsible executable so macOS applies
+    # its Local Network permission to Python, not a caffeinate launcher wrapper.
+    child=None
+    if sys.platform=='darwin':
+        child=subprocess.Popen(['/usr/bin/caffeinate','-i','-w',str(os.getpid())],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    try:yield
+    finally:
+        if child and child.poll() is None:
+            child.terminate();child.wait(timeout=5)
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',required=True);parser.add_argument('--once',action='store_true');args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     config=json.loads(Path(args.config).read_text())
     try:
-        with worker_lock(Path(config['state_dir'])/'agent.lock'):
-            Agent(config).run(args.once)
+        with worker_lock(Path(config['state_dir'])/'agent.lock'), prevent_idle_sleep():
+            run_supervised(config,args.once)
     except BlockingIOError: raise SystemExit('This worker state directory is already in use')
 
 

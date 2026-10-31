@@ -162,3 +162,32 @@ is authoritative; cached assignments cannot grant ownership. Heartbeats renew th
 lease separately from progress. FFmpeg is stopped if ownership/cancellation fails;
 NAS uploads check ownership between chunks. Completion is persisted locally and
 replayed with an idempotency key after a lost response.
+
+## Standalone Mac installation
+
+Use Homebrew Python 3.12 and Apple's command-line developer tools (the native
+launcher is compiled locally):
+
+```sh
+brew install python@3.12
+git clone https://github.com/haocs/tennis-processing.git
+cd tennis-processing
+/opt/homebrew/bin/python3.12 install_worker.py --config /path/to/private-worker.json
+```
+
+The installer pulls its managed source checkout from GitHub into
+`~/Library/Application Support/Tennis Worker/source`, installs an independent
+Python environment and pinned model dependency, and registers
+`~/Applications/Tennis Worker.app` to run at login. No IDE, Codex runtime or
+Documents-folder access is required. The initial checkout can be removed.
+Private settings, identity, checkpoints and logs stay under Application Support.
+
+Use `"$HOME/Library/Application Support/Tennis Worker/bin/workerctl"` followed by
+`status`, `logs`, `start`, `stop`, or `restart`. To update, pull the managed source
+checkout with `git pull --ff-only`, then rerun its installer using the private
+`worker.json`. Installation refuses to interrupt an active task.
+
+Storage mappings optionally accept `smb_url`, e.g. `//user@nas/share/path`, plus
+an identity marker. macOS reconnects the subfolder with existing saved SMB
+credentials. Never put passwords in URLs; mount in Finder first if credentials
+are unavailable. No local state, models or dryrun media are published to GitHub.

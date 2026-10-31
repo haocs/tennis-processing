@@ -52,3 +52,18 @@ def test_smb_timestamp_rounding_does_not_reject_unchanged_source():
     assert matches_signature(SimpleNamespace(st_size=100,st_mtime_ns=1_000_000_100),expected)
     assert not matches_signature(SimpleNamespace(st_size=101,st_mtime_ns=1_000_000_100),expected)
     assert not matches_signature(SimpleNamespace(st_size=100,st_mtime_ns=1_010_000_100),expected)
+
+
+def test_background_worker_stays_alive_and_recovers_from_network_failure(monkeypatch):
+    import api_worker
+    calls=[];sleeps=[]
+    class Fake:
+        def __init__(self,config):pass
+        def run(self,once):
+            calls.append(once)
+            if len(calls)==1:raise OSError('network unavailable')
+    monkeypatch.setattr(api_worker,'Agent',Fake)
+    api_worker.run_supervised({},sleep=sleeps.append)
+    assert calls==[False,False] and sleeps==[15]
+    calls.clear()
+    with pytest.raises(OSError):api_worker.run_supervised({},once=True,sleep=sleeps.append)
