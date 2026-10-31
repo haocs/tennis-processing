@@ -67,3 +67,21 @@ def test_background_worker_stays_alive_and_recovers_from_network_failure(monkeyp
     assert calls==[False,False] and sleeps==[15]
     calls.clear()
     with pytest.raises(OSError):api_worker.run_supervised({},once=True,sleep=sleeps.append)
+
+
+def test_mac_storage_reconnects_configured_mount_and_checks_identity(tmp_path,monkeypatch):
+    import api_worker
+    a=bare(tmp_path)
+    a.config['storage']['originals'].update(smb_url='//user@nas/share/originals',identity='expected',marker='.storage-id')
+    calls=[]
+    def mount(command,**kwargs):
+        calls.append(command)
+        (tmp_path/'.storage-id').write_text('expected')
+    monkeypatch.setattr(api_worker.sys,'platform','darwin')
+    monkeypatch.setattr(api_worker.subprocess,'run',mount)
+    assert a.ref({'storage_id':'originals','path':'video.mov'})==tmp_path/'video.mov'
+    assert calls==[['/sbin/mount_smbfs','-N','//user@nas/share/originals',str(tmp_path)]]
+    a.ref({'storage_id':'originals','path':'video.mov'})
+    assert len(calls)==1
+    (tmp_path/'.storage-id').write_text('different')
+    with pytest.raises(OSError,match='identity'):a.ref({'storage_id':'originals','path':'video.mov'})
