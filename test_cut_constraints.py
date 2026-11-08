@@ -3,7 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import pytest
-from cut_constraints import apply,load,validate,version_id
+from cut_constraints import apply,export_fps_for_source,load,min_frame_duration_ms,validate,validate_parameter_overrides,version_id
 
 SHA='a'*64
 
@@ -95,3 +95,95 @@ def test_empty_result_retains_metadata_without_encoding_media(tmp_path,monkeypat
     assert result["source_metadata"]["original_metadata"]==meta["original_metadata"]
     assert not (out/"Practice.mp4").exists() and (out/"edit-timeline.json").is_file()
     assert 'No retained clips' in (out/"Review.html").read_text()
+
+
+def test_nonlocal_overrides_rejected_for_disjoint_own_clip_or_overlapping_other_clip():
+    p=payload({'keep_intervals_ms':[],'exclude_intervals_ms':[],'override_clip_bounds_ms':[dict(clip_id='base',original_start_ms=2000,original_end_ms=5000,source_annotation_id='review',source_revision=2)]})
+    with pytest.raises(ValueError,match='override_does_not_overlap_base_clip'):
+        validate(p,SHA,30)
+    with pytest.raises(ValueError,match='override_does_not_overlap_base_clip'):
+        apply([[10,20]],p)
+    # Touching endpoint only (5000..10000 against 10000..20000) is not an overlap.
+    p['confirmed_commands']['override_clip_bounds_ms'][0].update(original_start_ms=5000,original_end_ms=10000)
+    with pytest.raises(ValueError,match='override_does_not_overlap_base_clip'):
+        validate(p,SHA,30)
+    # Add a second base clip [22s, 28s]; overriding 'base' into [10s, 22.001s] overlaps the second clip.
+    p['base_manifest']['clips'].append({'id':'second','original_start_seconds':22,'original_end_seconds':28})
+    p['confirmed_commands']['override_clip_bounds_ms'][0].update(original_start_ms=10000,original_end_ms=22001)
+    with pytest.raises(ValueError,match='override_overlaps_other_base_clip'):
+        validate(p,SHA,30)
+    with pytest.raises(ValueError,match='override_overlaps_other_base_clip'):
+        apply([[10,20],[22,28]],p)
+    # Touching the boundary of the next base clip without crossing into it is valid.
+    p['confirmed_commands']['override_clip_bounds_ms'][0].update(original_start_ms=10000,original_end_ms=22000)
+    validate(p,SHA,30)
+    assert apply([[10,20],[22,28]],p)==[[10,22],[22,28]]
+
+
+@pytest.mark.parametrize('bad_overrides',[
+    'not-a-dict',
+    {'unknown_param':1},
+    {'padding_before':True},
+    {'padding_after':-0.1},
+    {'merge_gap':float('nan')},
+    {'swing_speed':float('inf')},
+    {'arm_reach':10001},
+    {'target_region':[0.1,0.2,0.9]},
+    {'target_region':[False,0.2,0.9,0.8]},
+    {'target_region':[0.8,0.2,0.4,0.8]},
+    {'target_region':[0.1,0.8,0.9,0.2]},
+    {'target_region':[-0.1,0.2,0.9,0.8]},
+    {'target_region':[0.1,0.2,1.1,0.8]},
+])
+def test_parameter_overrides_validated_independently(bad_overrides):
+    p=payload()
+    p['parameter_overrides']=bad_overrides
+    with pytest.raises(ValueError,match='invalid_parameter_overrides'):
+        validate(p,SHA,30)
+
+
+def test_valid_parameter_overrides_accepted():
+    p=payload()
+    p['parameter_overrides']={'target_region':[0.05,0.1,0.95,0.9],'padding_before':1.5,'padding_after':2,'merge_gap':0}
+    validate(p,SHA,30)
+    assert validate_parameter_overrides(p['parameter_overrides'])==p['parameter_overrides']
+
+
+def test_subframe_detector_remainder_omitted_with_findings_and_confirmed_subframe_fails():
+    assert export_fps_for_source(29.97)==30
+    assert export_fps_for_source(59.94)==60
+    assert round(min_frame_duration_ms(export_fps=30),3)==33.333
+    assert round(min_frame_duration_ms(export_fps=60),3)==16.667
+    # Unforced 20ms detector remainder after hard exclude [10000, 19980] on [10, 20]:
+    p=payload({'keep_intervals_ms':[],'exclude_intervals_ms':[command(10000,19980)],'override_clip_bounds_ms':[]})
+    validate(p,SHA,30,export_fps=30)
+    # Default pure apply retains exact ms remainder for backward compatibility:
+    assert apply([[10,20]],p)==[[19.98,20.0]]
+    # With 30fps export (frame=33.333ms), the 20ms unforced detector remainder is omitted, never restoring the hard exclude:
+    findings30={}
+    assert apply([[10,20]],p,export_fps=30,findings_out=findings30)==[]
+    assert findings30=={
+        'export_fps':30,
+        'min_frame_duration_ms':33.333,
+        'omitted_subframe_count':1,
+        'omitted_subframe_remainders_ms':[{'start_ms':19980,'end_ms':20000,'duration_ms':20,'reason':'subframe_detector_remainder_omitted'}],
+    }
+    # With 60fps export (frame=16.667ms), 20ms is >= 1 export frame so it is kept, whereas a 10ms remainder is omitted:
+    findings60={}
+    assert apply([[10,20]],p,export_fps=60,findings_out=findings60)==[[19.98,20.0]]
+    assert findings60['omitted_subframe_count']==0
+    p10=payload({'keep_intervals_ms':[],'exclude_intervals_ms':[command(10000,19990)],'override_clip_bounds_ms':[]})
+    findings60_drop={}
+    assert apply([[10,20]],p10,export_fps=60,findings_out=findings60_drop)==[]
+    assert findings60_drop['omitted_subframe_count']==1
+    # Explicitly confirmed keep or override shorter than 1 export frame must fail clearly:
+    bad_keep=payload({'keep_intervals_ms':[command(5000,5020)],'exclude_intervals_ms':[],'override_clip_bounds_ms':[]})
+    with pytest.raises(ValueError,match='subframe_confirmed_interval'):
+        validate(bad_keep,SHA,30,export_fps=30)
+    with pytest.raises(ValueError,match='subframe_confirmed_interval'):
+        apply([[10,20]],bad_keep,export_fps=30)
+    bad_override=payload({'keep_intervals_ms':[],'exclude_intervals_ms':[],'override_clip_bounds_ms':[dict(clip_id='base',original_start_ms=15000,original_end_ms=15020,source_annotation_id='review',source_revision=2)]})
+    with pytest.raises(ValueError,match='subframe_confirmed_interval'):
+        validate(bad_override,SHA,30,export_fps=30)
+    with pytest.raises(ValueError,match='subframe_confirmed_interval'):
+        apply([[10,20]],bad_override,export_fps=30)

@@ -85,3 +85,149 @@ def test_mac_storage_reconnects_configured_mount_and_checks_identity(tmp_path,mo
     assert len(calls)==1
     (tmp_path/'.storage-id').write_text('different')
     with pytest.raises(OSError,match='identity'):a.ref({'storage_id':'originals','path':'video.mov'})
+
+
+def test_profile_refresh_retries_after_404_and_503_on_heartbeat_preserving_active_task(tmp_path,monkeypatch):
+    import api_worker
+    root=tmp_path/'state';root.mkdir()
+    active={'task':{'id':'task-1'},'attempt':{'id':'att-1','lease_token':'lease-1','lease_expires_at':200}}
+    (root/'worker.json').write_text(json.dumps({'worker_id':'existing','worker_token':'fixture-only','sequence':10,'active':active,'event_sequence':4}))
+    calls=[]
+    mode={'profile':'404'}
+    def call(self,path,body=None,bootstrap=False,**kwargs):
+        assert not bootstrap and path!='/workers/register'
+        calls.append((path,body))
+        if path=='/workers/existing/profile':
+            if mode['profile']=='404':raise api_worker.APIError(404,'old server')
+            if mode['profile']=='503':raise api_worker.APIError(503,'unavailable')
+            if mode['profile']=='401':raise api_worker.APIError(401,'unauthorized')
+            return {'version':12}
+        if path=='/workers/existing/heartbeat':
+            return {'lease_expires_at':300,'server_time':100,'cancel':False}
+        raise AssertionError(path)
+    monkeypatch.setattr(api_worker.API,'call',call)
+    cfg={'state_dir':str(root),'name':'Test','storage':{'originals':{'path':str(tmp_path)}},'processor':{}}
+    worker=api_worker.Agent(cfg)
+    assert worker.state['worker_id']=='existing' and worker.sequence==10 and not worker.profile_synced
+    assert worker.state['active']['task']['id']=='task-1'
+    # Transient 503 during heartbeat profile retry keeps worker_id/sequence and still sends capabilities on heartbeat:
+    mode['profile']='503'
+    worker.assignment=worker.state['active']
+    worker.heartbeat()
+    assert not worker.profile_synced and worker.sequence==11
+    hb_body=calls[-1][1]
+    assert 'cut-constraints-v1' in hb_body['capabilities'] and hb_body['accessible_storage_ids']==['originals']
+    assert hb_body['active']=={'attempt_id':'att-1','lease_token':'lease-1'}
+    assert hb_body['local_state']=={'task_id':'task-1','attempt_id':'att-1','acknowledged_sequence':4}
+    # Once server upgrade completes, next heartbeat syncs profile and advances sequence monotonically:
+    mode['profile']='ok'
+    worker.heartbeat()
+    assert worker.profile_synced and worker.sequence==13 and worker.state['sequence']==13
+    assert worker.assignment['attempt']['lease_expires_at']==300
+    # Auth 401/403 on profile sync must raise APIError and never bootstrap a new identity:
+    mode['profile']='401'
+    with pytest.raises(api_worker.APIError) as exc_info:
+        api_worker.Agent(cfg)
+    assert exc_info.value.code==401
+    assert json.loads((root/'worker.json').read_text())['worker_id']=='existing'
+
+
+def test_supervised_daemon_retries_transient_5xx_and_429_but_not_auth_401_403(monkeypatch):
+    import api_worker
+    errors=[api_worker.APIError(502,'bad gateway'),api_worker.APIError(503,'unavailable'),api_worker.APIError(429,'rate limit'),None]
+    sleeps=[]
+    class TransientAgent:
+        def __init__(self,config):
+            err=errors.pop(0)
+            if err is not None:raise err
+        def run(self,once):return
+    monkeypatch.setattr(api_worker,'Agent',TransientAgent)
+    api_worker.run_supervised({},sleep=sleeps.append)
+    assert sleeps==[15,15,15]
+    for code in (401,403,400):
+        sleeps.clear()
+        class AuthFailAgent:
+            def __init__(self,config):raise api_worker.APIError(code,'auth failed')
+            def run(self,once):return
+        monkeypatch.setattr(api_worker,'Agent',AuthFailAgent)
+        with pytest.raises(api_worker.APIError) as exc_info:
+            api_worker.run_supervised({},sleep=sleeps.append)
+        assert exc_info.value.code==code and sleeps==[]
+
+
+def test_worker_rejects_subframe_confirmed_keep_before_ffmpeg(tmp_path,monkeypatch):
+    import api_worker,pipeline
+    from cut_constraints import version_id
+    roots={name:{'path':str(tmp_path/name)} for name in ('originals','processing')}
+    for r in roots.values():Path(r['path']).mkdir()
+    source=Path(roots['originals']['path'])/'clip.mov';source.write_bytes(b'synthetic-video-bytes')
+    sha=hashlib.sha256(source.read_bytes()).hexdigest();stat=source.stat()
+    base={'id':sha,'published_at':1000.0,'processing':{'attempt_id':'b'*32},'source':{'sha256':sha,'duration_seconds':30},'clips':[{'id':'base','original_start_seconds':10,'original_end_seconds':20}]}
+    snap={'schema_version':1,'compiler_version':'cut-constraints-compiler-v1','source_sha256':sha,'base_attempt_id':'b'*32,'base_video_version_id':version_id(sha,1000.0),'base_manifest':base,
+          'selected_evidence_revisions':[{'annotation_id':'rev','version':1,'kind':'cut_feedback','context':{'publication':1000.0}}],
+          'confirmed_commands':{'keep_intervals_ms':[{'start_ms':5000,'end_ms':5020,'source_annotation_id':'rev','source_revision':1}],'exclude_intervals_ms':[],'override_clip_bounds_ms':[]}}
+    raw=json.dumps(snap,sort_keys=True,separators=(',',':')).encode();snap_sha=hashlib.sha256(raw).hexdigest()
+    snap_rel=f'snapshots/{sha}/{snap_sha}.json';snap_path=Path(roots['processing']['path'])/snap_rel;snap_path.parent.mkdir(parents=True);snap_path.write_bytes(raw)
+    calls=[]
+    def call(self,path,body=None,**kwargs):
+        calls.append((path,body))
+        if path.endswith('/register'):return {'worker_id':'w1','worker_token':'tok'}
+        if path.endswith('/heartbeat'):return {'lease_expires_at':9999999999,'server_time':100,'cancel':False}
+        if path.endswith('/events'):return {'acknowledged_sequence':body['events'][-1]['sequence']}
+        return {}
+    monkeypatch.setattr(api_worker.API,'call',call)
+    monkeypatch.setattr(pipeline,'probe',lambda p:{'duration':30.0,'fps':30.0,'width':160,'height':90,'transfer':1})
+    def no_ffmpeg(*args,**kwargs):raise AssertionError('FFmpeg must not run when confirmed keep is shorter than 1 export frame')
+    monkeypatch.setattr(pipeline,'prepare_video',no_ffmpeg)
+    monkeypatch.setattr(pipeline,'render_session',no_ffmpeg)
+    worker=api_worker.Agent({'state_dir':str(tmp_path/'worker'),'name':'Test','storage':roots,'processor':{}})
+    assignment={'task':{'id':'t1','type':'process','input':{'storage_id':'originals','path':'clip.mov','bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':sha},
+                        'parameters':{'cut_constraints_ref':{'storage_id':'processing','path':snap_rel,'sha256':snap_sha,'bytes':len(raw)}}},
+                'attempt':{'id':'a1','number':1,'lease_token':'lt','lease_expires_at':9999999999,'output_prefix':{'storage_id':'processing','path':'runs/a1'}}}
+    worker.execute(assignment)
+    assert calls[-1][0]=='/attempts/a1/fail' and calls[-1][1]['error_code']=='processing_failed'
+
+
+def test_worker_execute_omits_subframe_detector_remainder_and_records_findings(tmp_path,monkeypatch):
+    import api_worker,pipeline
+    from cut_constraints import version_id
+    roots={name:{'path':str(tmp_path/name)} for name in ('originals','processing')}
+    for r in roots.values():Path(r['path']).mkdir()
+    source=Path(roots['originals']['path'])/'clip.mov';source.write_bytes(b'synthetic-video-bytes')
+    sha=hashlib.sha256(source.read_bytes()).hexdigest();stat=source.stat()
+    base={'id':sha,'published_at':1000.0,'processing':{'attempt_id':'b'*32},'source':{'sha256':sha,'duration_seconds':30},'clips':[{'id':'base','original_start_seconds':10,'original_end_seconds':20}]}
+    # Exclude [10000, 19980] from detector [10, 20], leaving a 20ms (<33.333ms at 30fps) unforced detector remainder:
+    snap={'schema_version':1,'compiler_version':'cut-constraints-compiler-v1','source_sha256':sha,'base_attempt_id':'b'*32,'base_video_version_id':version_id(sha,1000.0),'base_manifest':base,
+          'selected_evidence_revisions':[{'annotation_id':'rev','version':1,'kind':'cut_feedback','context':{'publication':1000.0}}],
+          'confirmed_commands':{'keep_intervals_ms':[],'exclude_intervals_ms':[{'start_ms':10000,'end_ms':19980,'source_annotation_id':'rev','source_revision':1}],'override_clip_bounds_ms':[]}}
+    raw=json.dumps(snap,sort_keys=True,separators=(',',':')).encode();snap_sha=hashlib.sha256(raw).hexdigest()
+    snap_rel=f'snapshots/{sha}/{snap_sha}.json';snap_path=Path(roots['processing']['path'])/snap_rel;snap_path.parent.mkdir(parents=True);snap_path.write_bytes(raw)
+    calls=[]
+    def call(self,path,body=None,**kwargs):
+        calls.append((path,body))
+        if path.endswith('/register'):return {'worker_id':'w1','worker_token':'tok'}
+        if path.endswith('/heartbeat'):return {'lease_expires_at':9999999999,'server_time':100,'cancel':False}
+        if path.endswith('/events'):return {'acknowledged_sequence':body['events'][-1]['sequence']}
+        return {}
+    monkeypatch.setattr(api_worker.API,'call',call)
+    meta={'duration':30.0,'fps':30.0,'width':160,'height':90,'transfer':1,'recorded_at':'2026-01-01T00:00:00Z','original_metadata':{'container_tags':{'make':'Apple'}}}
+    monkeypatch.setattr(pipeline,'probe',lambda p:meta)
+    def fake_prepare(src,scratch,cfg):
+        (scratch/'analysis.mp4').write_bytes(b'proxy')
+        return meta,scratch/'analysis.mp4'
+    monkeypatch.setattr(pipeline,'prepare_video',fake_prepare)
+    monkeypatch.setattr(pipeline,'analyze_video',lambda *args:([[10.0,20.0]],{'detector':'synthetic'}))
+    monkeypatch.setattr(pipeline,'export_profile',lambda m:('',[],{'fixture':True}))
+    def no_media(*args,**kwargs):raise AssertionError('Subframe remainder must be omitted without running FFmpeg media encode')
+    monkeypatch.setattr(pipeline,'run_media',no_media)
+    monkeypatch.setattr(pipeline,'build_playback',no_media)
+    worker=api_worker.Agent({'state_dir':str(tmp_path/'worker'),'name':'Test','storage':roots,'processor':{}})
+    assignment={'task':{'id':'t2','type':'dryrun','input':{'storage_id':'originals','path':'clip.mov','bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':sha},
+                        'parameters':{'cut_constraints_ref':{'storage_id':'processing','path':snap_rel,'sha256':snap_sha,'bytes':len(raw)}}},
+                'attempt':{'id':'a2','number':1,'lease_token':'lt','lease_expires_at':9999999999,'output_prefix':{'storage_id':'processing','path':'runs/a2'}}}
+    worker.execute(assignment)
+    assert calls[-1][0]=='/attempts/a2/complete'
+    cc=calls[-1][1]['findings']['cut_constraints']
+    assert cc['export_fps']==30 and cc['min_frame_duration_ms']==33.333
+    assert cc['omitted_subframe_count']==1
+    assert cc['omitted_subframe_remainders_ms']==[{'start_ms':19980,'end_ms':20000,'duration_ms':20,'reason':'subframe_detector_remainder_omitted'}]

@@ -74,17 +74,32 @@ class Agent:
         self.runtime={'executor_version':'2.0.0','build_digest':code.hexdigest(),'model_sha256':checksum(model) if model.is_file() else None,'backend':config.get('processor',{}).get('pose_device','coreml')}
 
         import platform
-        profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':['process-v2','cut-constraints-v1','heuristic-diagnostics-v1'],'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
+        self.profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':['process-v2','cut-constraints-v1','heuristic-diagnostics-v1'],'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
+        self.profile_synced=False
         if not self.state.get('worker_id'):
-            data=self.api.call('/workers/register',profile,bootstrap=True)
-            self.state.update(data);atomic(self.state_path,self.state)
+            data=self.api.call('/workers/register',self.profile,bootstrap=True)
+            self.state.update(data);self.profile_synced=True;atomic(self.state_path,self.state)
         else:
+            self.sync_profile()
+
+    def sync_profile(self):
+        if not getattr(self,'profile',None) or not self.state.get('worker_id'): return False
+        with self.lock:
             try:
-                refreshed=self.api.call('/workers/'+self.state['worker_id']+'/profile',profile)
-                if type(refreshed.get('version')) is int:self.sequence=max(self.sequence,refreshed['version'])
+                refreshed=self.api.call('/workers/'+self.state['worker_id']+'/profile',self.profile)
+                if isinstance(refreshed,dict) and type(refreshed.get('version')) is int:
+                    self.sequence=max(self.sequence,refreshed['version'])
                 self.state['sequence']=self.sequence;atomic(self.state_path,self.state)
+                self.profile_synced=True
+                return True
             except APIError as error:
-                if error.code not in (404,405):raise  # Old servers have no profile endpoint; retain the registered identity.
+                if error.code in (404,405,429) or 500<=error.code<600:
+                    self.profile_synced=False
+                    return False
+                raise
+            except OSError:
+                self.profile_synced=False
+                return False
 
 
     def ref(self,ref):
@@ -115,8 +130,13 @@ class Agent:
 
     def heartbeat(self):
         with self.lock:
+            if not getattr(self,'profile_synced',True):
+                self.sync_profile()
             self.sequence+=1
             body={'sequence':self.sequence,'runtime':self.runtime,'stage':self.state.get('stage','Idle'),'last_progress_at':self.last_progress,'local_state':{'task_id':self.assignment['task']['id'] if self.assignment else None,'attempt_id':self.assignment['attempt']['id'] if self.assignment else None,'acknowledged_sequence':self.state.get('event_sequence',0)}}
+            if getattr(self,'profile',None):
+                body['capabilities']=list(self.profile['capabilities'])
+                body['accessible_storage_ids']=list(self.profile['accessible_storage_ids'])
             if self.assignment:
                 a=self.assignment['attempt'];body['active']={'attempt_id':a['id'],'lease_token':a['lease_token']}
             result=self.api.call('/workers/'+self.state['worker_id']+'/heartbeat',body)
@@ -216,13 +236,19 @@ class Agent:
                 return value
             digest=stage('verify_source',verify,lambda:[local]);timing.digest=digest
             parameters=task.get('parameters',{})
-            if set(parameters)-PARAMETERS-{'cut_constraints_ref'}:raise ValueError('unsupported_task_parameters')
+            if not isinstance(parameters,dict) or set(parameters)-PARAMETERS-{'cut_constraints_ref'}:raise ValueError('unsupported_task_parameters')
+            from cut_constraints import apply,export_fps_for_source,load,validate_parameter_overrides
+            validate_parameter_overrides({k:v for k,v in parameters.items() if k!='cut_constraints_ref'})
             constraints_ref=parameters.get('cut_constraints_ref')
             constraint_payload=None
             if constraints_ref:
                 self.ref(constraints_ref)  # Verify mounted storage identity before opening the bounded artifact.
-                from cut_constraints import load
-                constraint_payload=load(self.config['storage']['processing']['path'],constraints_ref,scratch/'feedback-snapshot.json',digest,pipeline.probe(local)['duration'])
+                probed=pipeline.probe(local)
+                constraint_payload=load(self.config['storage']['processing']['path'],constraints_ref,scratch/'feedback-snapshot.json',digest,probed['duration'],export_fps=export_fps_for_source(probed['fps']))
+                snap_overrides=constraint_payload.get('parameter_overrides') or {}
+                if any(k in parameters and parameters[k]!=v for k,v in snap_overrides.items()):
+                    raise ValueError('parameter_override_mismatch')
+                cfg.update(snap_overrides)
                 cfg['_allow_empty_analysis']=True
 
             def prepare():
@@ -237,10 +263,11 @@ class Agent:
                 out.mkdir()
                 intervals,findings=analysis[0],dict(analysis[1])
                 if constraint_payload is not None:
-                    from cut_constraints import apply
-                    intervals=apply(intervals,constraint_payload)
+                    assembly_findings={}
+                    intervals=apply(intervals,constraint_payload,export_fps=export_fps_for_source(meta['fps']),findings_out=assembly_findings)
                     findings['cut_constraints']={'schema_version':1,'snapshot_sha256':constraints_ref['sha256'],'base_video_version_id':constraint_payload['base_video_version_id'],
-                                                'base_attempt_id':constraint_payload['base_attempt_id'],'commands':{k:len(v) for k,v in constraint_payload['confirmed_commands'].items()},'applied_after_padding_and_merging':True}
+                                                'base_attempt_id':constraint_payload['base_attempt_id'],'commands':{k:len(v) for k,v in constraint_payload['confirmed_commands'].items()},'applied_after_padding_and_merging':True,
+                                                **assembly_findings}
                 return pipeline.render_session(local,out,cfg,digest,source.name,intervals,findings,meta)
             report=stage('process',process,lambda:list(out.rglob('*')))
             timing.info['clips']=report['clips']
@@ -263,7 +290,10 @@ class Agent:
                 original=source.stat()
                 if not matches_signature(original,input_ref) or checksum(source)!=digest: raise ValueError('source_changed')
                 atomic(bundle/'result.json',{'schema_version':1,'task_id':task['id'],'attempt_id':attempt['id'],'source_sha256':digest,'session':public,'parameters':task.get('parameters',{}),'pipeline_version':'2.0.0','runtime':self.runtime,'files':[{'path':p.relative_to(bundle).as_posix(),'bytes':p.stat().st_size,'sha256':checksum(p)} for p in bundle.rglob('*') if p.is_file()]})
-                return {'clips':report['clips'],'kept_seconds':report['kept_seconds']}
+                out_findings={'clips':report['clips'],'kept_seconds':report['kept_seconds']}
+                if isinstance(report.get('analysis'),dict) and 'cut_constraints' in report['analysis']:
+                    out_findings['cut_constraints']=report['analysis']['cut_constraints']
+                return out_findings
             # Attempt IDs differ after retries; always refresh manifest packaging.
             cache_data['stages'].pop('package_result',None)
             findings=stage('package_result',package,lambda:list(bundle.rglob('*')))
@@ -320,8 +350,10 @@ class Agent:
                 if self.assignment:
                     try:
                         self.heartbeat();assignment=self.assignment
-                    except APIError:
-                        self.assignment=None
+                    except APIError as exc:
+                        if exc.code in (401,403,404,409):
+                            self.assignment=None;self.persist()
+                        else: raise
                 if not assignment: assignment=self.api.call('/workers/'+self.state['worker_id']+'/claims',{'request_id':uuid.uuid4().hex})
                 if assignment: self.execute(assignment)
                 elif once: return
@@ -348,6 +380,10 @@ def worker_lock(path):
                 stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_UNLCK,1)
 
 
+def is_transient_api_error(exc):
+    return isinstance(exc,APIError) and (exc.code==429 or 500<=exc.code<600)
+
+
 def run_supervised(config, once=False, sleep=time.sleep):
     # A short-lived launch agent can disappear before macOS displays its local
     # network permission alert. Keep the process alive and recover on reconnect.
@@ -355,8 +391,8 @@ def run_supervised(config, once=False, sleep=time.sleep):
         try:
             Agent(config).run(once)
             return
-        except OSError:
-            if once: raise
+        except (OSError,APIError) as exc:
+            if once or (isinstance(exc,APIError) and not is_transient_api_error(exc)): raise
             LOG.warning('Server connection unavailable; keeping worker alive and retrying in 15 seconds')
             sleep(15)
 
