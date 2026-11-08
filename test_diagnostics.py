@@ -484,7 +484,7 @@ def test_end_to_end_packaging_frozen_publication_and_dryrun(tmp_path, monkeypatc
     assert not publication.validate_library(media_dest, digest)
 
 
-def test_runtime_build_digest_includes_diagnostics_and_legacy_outputs_remain_valid(tmp_path):
+def test_runtime_build_digest_includes_diagnostics_and_legacy_outputs_remain_valid(tmp_path,monkeypatch):
     # Legacy output without heuristic-diagnostics.json remains valid
     legacy_dir = tmp_path / "legacy-result"
     legacy_dir.mkdir()
@@ -498,11 +498,12 @@ def test_runtime_build_digest_includes_diagnostics_and_legacy_outputs_remain_val
     # Verify api_worker build_digest hashes diagnostics.py and publication.py
     expected = hashlib.sha256()
     root = Path(api_worker.__file__).parent
-    for name in ("api_worker.py", "pipeline.py", "detector.py", "diagnostics.py", "publication.py", "color.py", "playback.py", "timeline.py"):
+    for name in ("api_worker.py", "pipeline.py", "detector.py", "cut_constraints.py", "diagnostics.py", "publication.py", "color.py", "playback.py", "timeline.py"):
         expected.update((root / name).read_bytes())
     state_dir = tmp_path / "wstate"
     state_dir.mkdir()
     (state_dir / "worker.json").write_text(json.dumps({"worker_id": "w_existing", "worker_token": "tok"}))
+    monkeypatch.setattr(api_worker.API,"call",lambda *args,**kwargs:{"version":1})
     agent = api_worker.Agent(
         {
             "name": "w",
@@ -515,3 +516,10 @@ def test_runtime_build_digest_includes_diagnostics_and_legacy_outputs_remain_val
     )
     assert agent.runtime["build_digest"] == expected.hexdigest()
 
+
+
+def test_version_identity_matches_website_contract():
+    public = {"id": "a"*64, "published_at": 1234.125, "clips": []}
+    expected = "v_" + hashlib.sha256(json.dumps([public["id"], 1234.125], separators=(",", ":")).encode()).hexdigest()[:32]
+    assert diagnostics.compute_video_version_id(public, attempt_id="b"*32)[0] == expected
+    assert diagnostics.compute_video_version_id(dict(public, media_directory="elsewhere"))[0] == expected

@@ -68,15 +68,24 @@ class Agent:
         self.api=API(config,self.state);self.lock=threading.RLock();self.assignment=None;self.last_progress=0;self.failed=None;self.stop=threading.Event();self.next_heartbeat=0
         self.sequence=self.state.get('sequence',0);self.pending=None;self.deadline=None
         code=hashlib.sha256()
-        for name in ('api_worker.py','pipeline.py','detector.py','diagnostics.py','publication.py','color.py','playback.py','timeline.py'):
+        for name in ('api_worker.py','pipeline.py','detector.py','cut_constraints.py','diagnostics.py','publication.py','color.py','playback.py','timeline.py'):
             code.update((Path(__file__).parent/name).read_bytes())
         model=Path(config.get('processor',{}).get('rallyclip_path',''))/'models/rallyclip_v0.6.0/yolov8n-pose-544x960-static.onnx'
         self.runtime={'executor_version':'2.0.0','build_digest':code.hexdigest(),'model_sha256':checksum(model) if model.is_file() else None,'backend':config.get('processor',{}).get('pose_device','coreml')}
 
+        import platform
+        profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':['process-v2','cut-constraints-v1','heuristic-diagnostics-v1'],'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
         if not self.state.get('worker_id'):
-            import platform
-            data=self.api.call('/workers/register',{'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':['process-v2'],'accessible_storage_ids':list(config['storage']),'runtime':self.runtime},bootstrap=True)
+            data=self.api.call('/workers/register',profile,bootstrap=True)
             self.state.update(data);atomic(self.state_path,self.state)
+        else:
+            try:
+                refreshed=self.api.call('/workers/'+self.state['worker_id']+'/profile',profile)
+                if type(refreshed.get('version')) is int:self.sequence=max(self.sequence,refreshed['version'])
+                self.state['sequence']=self.sequence;atomic(self.state_path,self.state)
+            except APIError as error:
+                if error.code not in (404,405):raise  # Old servers have no profile endpoint; retain the registered identity.
+
 
     def ref(self,ref):
         spec=self.config['storage'][ref['storage_id']];root=Path(spec['path']).resolve()
@@ -206,6 +215,16 @@ class Agent:
                 if input_ref.get('sha256') and value!=input_ref['sha256']: raise ValueError('source_hash_mismatch')
                 return value
             digest=stage('verify_source',verify,lambda:[local]);timing.digest=digest
+            parameters=task.get('parameters',{})
+            if set(parameters)-PARAMETERS-{'cut_constraints_ref'}:raise ValueError('unsupported_task_parameters')
+            constraints_ref=parameters.get('cut_constraints_ref')
+            constraint_payload=None
+            if constraints_ref:
+                self.ref(constraints_ref)  # Verify mounted storage identity before opening the bounded artifact.
+                from cut_constraints import load
+                constraint_payload=load(self.config['storage']['processing']['path'],constraints_ref,scratch/'feedback-snapshot.json',digest,pipeline.probe(local)['duration'])
+                cfg['_allow_empty_analysis']=True
+
             def prepare():
                 meta,proxy=pipeline.prepare_video(local,scratch,cfg)
                 return meta
@@ -216,7 +235,13 @@ class Agent:
             def process():
                 if out.exists(): shutil.rmtree(out)
                 out.mkdir()
-                return pipeline.render_session(local,out,cfg,digest,source.name,analysis[0],analysis[1],meta)
+                intervals,findings=analysis[0],dict(analysis[1])
+                if constraint_payload is not None:
+                    from cut_constraints import apply
+                    intervals=apply(intervals,constraint_payload)
+                    findings['cut_constraints']={'schema_version':1,'snapshot_sha256':constraints_ref['sha256'],'base_video_version_id':constraint_payload['base_video_version_id'],
+                                                'base_attempt_id':constraint_payload['base_attempt_id'],'commands':{k:len(v) for k,v in constraint_payload['confirmed_commands'].items()},'applied_after_padding_and_merging':True}
+                return pipeline.render_session(local,out,cfg,digest,source.name,intervals,findings,meta)
             report=stage('process',process,lambda:list(out.rglob('*')))
             timing.info['clips']=report['clips']
             bundle=scratch/'bundle'
@@ -224,9 +249,9 @@ class Agent:
                 if bundle.exists(): shutil.rmtree(bundle)
                 media=bundle/'media';metadata=bundle/'metadata';media.mkdir(parents=True);metadata.mkdir()
                 _,public=metadata_for_session(out)
-                for name in ['Practice.mp4']+[c['file'] for c in public['clips']]:
+                for name in (['Practice.mp4']+[c['file'] for c in public['clips']] if public['clips'] else []):
                     target=media/name;target.parent.mkdir(parents=True,exist_ok=True);os.link(out/name,target)
-                poster(out,media/'poster.jpg')
+                if public['clips']:poster(out,media/'poster.jpg')
                 for name in public['artifacts']: shutil.copyfile(out/name,metadata/name)
                 if (metadata/'heuristic-diagnostics.json').is_file():
                     from diagnostics import bind_publication_diagnostics

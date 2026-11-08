@@ -56,3 +56,13 @@ Key invariants and fields:
 - Allowed `identity_status`: `"unverified_single_primary_track"`, `"ambiguous_multiple_persons"`, `"no_person_detected"`, `"unknown"`.
 - Every hint satisfies `parent.original_start_ms <= hint.original_start_ms < hint.original_end_ms <= parent.original_end_ms <= source_duration_ms`.
 
+
+## Feedback-guided candidates
+
+API workers advertise `cut-constraints-v1` and refresh their authenticated profile while retaining the installed worker identity. Old servers without the profile endpoint remain compatible; an authentication failure is not treated as registration permission. Runtime build digests include the constraints and diagnostics modules.
+
+`parameters.cut_constraints_ref` points to a server-owned immutable JSON artifact in processing storage. The worker reads at most 256 KiB, verifies bytes/hash, rejects symlinks and traversal, and keeps a verified local copy for retries. The artifact embeds the verified base manifest and selected evidence revisions. Source SHA, frozen version/attempt, duration, command intervals and contradictions are checked again locally.
+
+Commands run after detector padding and merging. Overrides replace the union of old/new base span and preserve exact new clip edges even if the current detector produced different cuts. Explicit keep ranges are retained; hard excludes are subtracted last and never bridged by a later merge. These commands are operator choices, not training truth. An all-exclude result is metadata-only, with no video or poster. It may be staged for comparison, but cannot become serving output. Dryrun retains all generated artifacts locally and publishes no NAS media/result bundle.
+
+The common video-version ID is `v_` plus the first 32 hex characters of SHA256(compact JSON `[source_sha256, float(published_at)]`). A separate descriptor digest is provenance, not the version identity. Public metadata checksums cover the frozen diagnostics artifact.

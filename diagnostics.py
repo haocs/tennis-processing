@@ -1065,7 +1065,9 @@ def compute_video_version_id(public: dict, attempt_id: str | None = None) -> tup
         ],
     }
     digest = compact_json_sha256(canonical)
-    return f"v_{digest[:32]}", digest
+    # Shared website/server identity: compact JSON of source SHA + frozen token.
+    identity = hashlib.sha256(json.dumps([public["id"], float(published_at)], separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    return f"v_{identity[:32]}", digest
 
 
 def build_publication_linkage(
