@@ -196,6 +196,7 @@ def build_extraction_provenance(
         "width": proxy_w,
         "height": proxy_h,
         "target_fps": target_fps,
+        "actual_fps": actual_fps,
         "rotation_degrees": rotation_degrees,
         "crop_box": crop_box,
         "color_transfer": color_transfer,
