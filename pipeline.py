@@ -170,12 +170,39 @@ def render_session(source, out, cfg, digest, original_name, intervals, analysis,
         writer = csv.writer(f)
         writer.writerow(["clip", "original_start_seconds", "original_end_seconds"])
         writer.writerows((f"clip-{i:03d}.mp4", f"{a:.3f}", f"{b:.3f}") for i, (a, b) in enumerate(intervals, 1))
-    report = {"source": original_name, "source_sha256": digest, "source_metadata": meta, "kept_seconds": round(kept, 3), "removed_seconds": round(meta["duration"]-kept, 3), "clips": len(intervals), "intervals": intervals, "analysis": analysis, "processing_seconds": round(time.monotonic()-started, 1), "settings": {k: cfg[k] for k in ("target_region", "min_player_height", "swing_speed", "arm_reach", "padding_before", "padding_after", "merge_gap") if k in cfg}}
+    from diagnostics import build_heuristic_diagnostics, load_local_observations
+    from publication import public_session
+    raw_analysis = dict(analysis or {})
+    inline_observations = raw_analysis.pop("_frame_observations", None) or cfg.get("_frame_observations")
+    inline_records = raw_analysis.pop("pose_records", None) or raw_analysis.pop("_pose_records", None) or cfg.get("pose_records")
+    local_observations, local_proxy_meta = load_local_observations(out.parent / "pose-observations.json")
+    if local_proxy_meta and "proxy_observation_meta" not in raw_analysis:
+        raw_analysis["proxy_observation_meta"] = local_proxy_meta
+    analysis_for_diag = dict(raw_analysis)
+    if inline_records is not None:
+        analysis_for_diag["pose_records"] = inline_records
+    published_at = time.time()
+    report = {"source": original_name, "source_sha256": digest, "source_metadata": meta, "published_at": published_at, "kept_seconds": round(kept, 3), "removed_seconds": round(meta["duration"]-kept, 3), "clips": len(intervals), "intervals": intervals, "analysis": raw_analysis, "processing_seconds": round(time.monotonic()-started, 1), "settings": {k: cfg[k] for k in ("target_region", "min_player_height", "swing_speed", "arm_reach", "padding_before", "padding_after", "merge_gap") if k in cfg}}
     report["encoding"] = encoding
     progress(cfg, "Aligning playback chapters")
     report["playback"] = build_playback(out, intervals)
     progress(cfg, "Writing timeline and checksums")
     write_review(out, report)
+    report["heuristic_diagnostics"] = "heuristic-diagnostics.json"
+    frozen_public = public_session(report, report["playback"])
+    diagnostics_payload = build_heuristic_diagnostics(
+        source_sha256=digest,
+        duration_seconds=meta["duration"],
+        intervals=intervals,
+        cfg=cfg,
+        meta=meta,
+        analysis=analysis_for_diag,
+        frame_observations=inline_observations if inline_observations is not None else local_observations,
+        public=frozen_public,
+        task_id=cfg.get("_task_id"),
+        attempt_id=cfg.get("_attempt_id"),
+    )
+    atomic_json(out / "heuristic-diagnostics.json", diagnostics_payload)
     report["output_checksums"] = {str(p.relative_to(out)): sha256(p) for p in out.rglob("*") if p.is_file()}
     atomic_json(out / "session.json", report)
     return report

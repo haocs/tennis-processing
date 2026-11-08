@@ -68,7 +68,7 @@ class Agent:
         self.api=API(config,self.state);self.lock=threading.RLock();self.assignment=None;self.last_progress=0;self.failed=None;self.stop=threading.Event();self.next_heartbeat=0
         self.sequence=self.state.get('sequence',0);self.pending=None;self.deadline=None
         code=hashlib.sha256()
-        for name in ('api_worker.py','pipeline.py','detector.py','color.py','playback.py','timeline.py'):
+        for name in ('api_worker.py','pipeline.py','detector.py','diagnostics.py','publication.py','color.py','playback.py','timeline.py'):
             code.update((Path(__file__).parent/name).read_bytes())
         model=Path(config.get('processor',{}).get('rallyclip_path',''))/'models/rallyclip_v0.6.0/yolov8n-pose-544x960-static.onnx'
         self.runtime={'executor_version':'2.0.0','build_digest':code.hexdigest(),'model_sha256':checksum(model) if model.is_file() else None,'backend':config.get('processor',{}).get('pose_device','coreml')}
@@ -180,7 +180,7 @@ class Agent:
         fingerprint=hashlib.sha256(json.dumps({'task':task,'runtime':self.runtime,'effective_parameters':{k:self.config['processor'].get(k) for k in PARAMETERS}},sort_keys=True).encode()).hexdigest()
         if cache_data.get('fingerprint')!=fingerprint: cache_data={'fingerprint':fingerprint,'stages':{}}
         timing=JobTiming(source.name,time.time(),attempt['number']);pipeline.EXECUTION_GUARD=self.guard
-        cfg=dict(self.config['processor']);cfg.update({k:v for k,v in task.get('parameters',{}).items() if k in PARAMETERS});cfg.update(_monitor=self,_timing=timing,_guard=self.guard)
+        cfg=dict(self.config['processor']);cfg.update({k:v for k,v in task.get('parameters',{}).items() if k in PARAMETERS});cfg.update(_monitor=self,_timing=timing,_guard=self.guard,_task_id=task['id'],_attempt_id=attempt['id'])
         result_ref=None;digest=None
         def stage(name,operation,files):
             self.guard();self.state['stage']=name;self.last_progress=time.time();timing.transition(name);self.event('stage_started',name)
@@ -211,7 +211,7 @@ class Agent:
                 return meta
             meta=stage('prepare_proxy',prepare,lambda:[scratch/'analysis.mp4'])
             timing.info={k:meta[k] for k in ('duration','width','height','fps','transfer')}
-            analysis=stage('analyze',lambda:list(pipeline.analyze_video(scratch/'analysis.mp4',meta,cfg)),lambda:[])
+            analysis=stage('analyze',lambda:list(pipeline.analyze_video(scratch/'analysis.mp4',meta,cfg)),lambda:[p for p in (scratch/'pose-observations.json',) if p.is_file()])
             out.mkdir(exist_ok=True)
             def process():
                 if out.exists(): shutil.rmtree(out)
@@ -228,6 +228,9 @@ class Agent:
                     target=media/name;target.parent.mkdir(parents=True,exist_ok=True);os.link(out/name,target)
                 poster(out,media/'poster.jpg')
                 for name in public['artifacts']: shutil.copyfile(out/name,metadata/name)
+                if (metadata/'heuristic-diagnostics.json').is_file():
+                    from diagnostics import bind_publication_diagnostics
+                    bind_publication_diagnostics(metadata/'heuristic-diagnostics.json',public,task_id=task['id'],attempt_id=attempt['id'])
                 atomic(metadata/'original-metadata.json',meta)
                 public['artifacts'].append('original-metadata.json')
                 public['media_checksums']={p.relative_to(media).as_posix():checksum(p) for p in media.rglob('*') if p.is_file()}

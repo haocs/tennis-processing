@@ -5,6 +5,7 @@ No source filesystem paths, raw private job logs, or credentials are published.
 from pathlib import Path
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -26,17 +27,24 @@ def public_session(report, playback, media_directory=None):
         item = dict(item)
         item["id"] = clip_id(digest, item["original_start_seconds"], item["original_end_seconds"])
         clips.append(item)
+    published_at = report.get("published_at")
+    if isinstance(published_at, bool) or not isinstance(published_at, (int, float)) or not math.isfinite(published_at):
+        published_at = time.time()
+        report["published_at"] = published_at
+    artifacts = ["edit-timeline.csv", "edit-timeline.json", "timestamps.csv", "Review.html"]
+    if report.get("heuristic_diagnostics") == "heuristic-diagnostics.json":
+        artifacts.append("heuristic-diagnostics.json")
     return {"schema_version": 1, "id": digest, "title": Path(report["source"]).stem,
             "source": {"name": Path(report["source"]).name, "sha256": digest,
                        "recorded_at": source.get("recorded_at", ""), "duration_seconds": source["duration"],
                        "location": source.get("location")},
-            "published_at": time.time(), "media_directory": media_directory or digest,
+            "published_at": published_at, "media_directory": media_directory or digest,
             "video": {"file": "Practice.mp4", "poster": "poster.jpg", "duration_seconds": playback["duration_seconds"],
                       "width": source["width"], "height": source["height"], "hdr": source["transfer"] in (16, 18)},
             "clips": clips, "kept_seconds": report["kept_seconds"], "removed_seconds": report["removed_seconds"],
             "chapter_alignment": playback["alignment"], "algorithm": report["analysis"].get("detector", "unknown"),
             "encoding": report.get("encoding", {}),
-            "artifacts": ["edit-timeline.csv", "edit-timeline.json", "timestamps.csv", "Review.html"]}
+            "artifacts": artifacts}
 
 
 def poster(session, destination):
@@ -52,7 +60,10 @@ def poster(session, destination):
 
 def metadata_for_session(session):
     from playback import build_playback
-    report = json.loads((Path(session) / "session.json").read_text())
+    session = Path(session)
+    report = json.loads((session / "session.json").read_text())
+    if (session / "heuristic-diagnostics.json").is_file() and "heuristic_diagnostics" not in report:
+        report["heuristic_diagnostics"] = "heuristic-diagnostics.json"
     playback = report.get("playback") or build_playback(session, report["intervals"])
     return report, public_session(report, playback)
 
@@ -100,6 +111,9 @@ def publish_library(local, root, name=None, digest=None):
                     timeline = json.loads((stage / "metadata" / artifact).read_text())
                     timeline["source"] = Path(report["source"]).name
                     atomic_json(stage / "metadata" / artifact, timeline)
+                elif artifact == "heuristic-diagnostics.json":
+                    from diagnostics import bind_publication_diagnostics
+                    bind_publication_diagnostics(stage / "metadata" / artifact, public)
         public["media_checksums"] = {str(p.relative_to(stage / "media")): sha256(p) for p in (stage / "media").rglob("*") if p.is_file()}
         public["metadata_checksums"] = {p.name: sha256(p) for p in (stage / "metadata").iterdir() if p.is_file()}
         (stage / "media").rename(media)
@@ -131,6 +145,9 @@ def validate_library(media, digest):
             p = (root / "metadata/sessions" / digest / name).resolve()
             if not p.is_relative_to((root / "metadata/sessions" / digest).resolve()) or sha256(p) != expected:
                 return False
+            if name == "heuristic-diagnostics.json":
+                from diagnostics import validate_heuristic_diagnostics
+                validate_heuristic_diagnostics(json.loads(p.read_text()), expected_source_sha256=digest)
         return True
     except (OSError, ValueError, KeyError, TypeError):
         return False

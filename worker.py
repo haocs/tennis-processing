@@ -132,6 +132,9 @@ def validate_publication(dest, digest):
             p = dest / name
             if not p.is_relative_to(dest) or sha256(p) != expected:
                 return False
+            if name == "heuristic-diagnostics.json":
+                from diagnostics import validate_heuristic_diagnostics
+                validate_heuristic_diagnostics(json.loads(p.read_text()), expected_source_sha256=digest)
         return bool(manifest["output_checksums"])
     except (OSError, ValueError, KeyError, TypeError):
         return False
