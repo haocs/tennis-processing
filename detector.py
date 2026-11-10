@@ -99,6 +99,8 @@ def detect(video, cfg):
         stream = container.streams.video[0]
         duration = float(stream.duration * stream.time_base)
         width, height = stream.width, stream.height
+        pts_timebase = str(stream.time_base)
+        actual_fps = float(stream.average_rate or 8.0)
         for frame in container.decode(stream):
             if cfg.get("_guard"): cfg["_guard"]()
             result = pose.model.predict(frame.to_ndarray(format="bgr24"), conf=0.30, imgsz=960)[0]
@@ -108,6 +110,18 @@ def detect(video, cfg):
                 progress(cfg, "Analyzing player movement", round(float(frame.time), 1), round(duration, 1), "video seconds")
                 last_log = time.monotonic()
     events, visibility = score_poses(records, cfg, width, height)
+    from diagnostics import extract_frame_observations, save_local_observations
+    proxy_meta = {
+        "width": width,
+        "height": height,
+        "target_fps": 8.0,
+        "actual_fps": actual_fps,
+        "pts_timebase": pts_timebase,
+        "frame_count": len(records),
+    }
+    observations = extract_frame_observations(records, cfg, width, height, events=events)
+    save_local_observations(Path(video).parent / "pose-observations.json", observations, proxy_meta=proxy_meta)
     intervals = merge_intervals(events, duration, cfg.get("padding_before", 2.0), cfg.get("padding_after", 1.5), cfg.get("merge_gap", 0.5))
     return intervals, {"detector": VERSION, "target_visible_fraction": round(visibility, 3), "motion_events": len(events), "event_intervals": events,
+                       "proxy_observation_meta": proxy_meta,
                        "note": "Candidate practice activity based on near-player pose motion. May include shadow swings or walking and miss obscured/slow strokes. Original is preserved."}

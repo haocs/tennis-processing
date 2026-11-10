@@ -68,15 +68,39 @@ class Agent:
         self.api=API(config,self.state);self.lock=threading.RLock();self.assignment=None;self.last_progress=0;self.failed=None;self.stop=threading.Event();self.next_heartbeat=0
         self.sequence=self.state.get('sequence',0);self.pending=None;self.deadline=None
         code=hashlib.sha256()
-        for name in ('api_worker.py','pipeline.py','detector.py','color.py','playback.py','timeline.py'):
+        for name in ('api_worker.py','pipeline.py','detector.py','cut_constraints.py','diagnostics.py','publication.py','color.py','playback.py','timeline.py'):
             code.update((Path(__file__).parent/name).read_bytes())
         model=Path(config.get('processor',{}).get('rallyclip_path',''))/'models/rallyclip_v0.6.0/yolov8n-pose-544x960-static.onnx'
         self.runtime={'executor_version':'2.0.0','build_digest':code.hexdigest(),'model_sha256':checksum(model) if model.is_file() else None,'backend':config.get('processor',{}).get('pose_device','coreml')}
 
+        import platform
+        self.profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':['process-v2','cut-constraints-v1','heuristic-diagnostics-v1'],'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
+        self.profile_synced=False
         if not self.state.get('worker_id'):
-            import platform
-            data=self.api.call('/workers/register',{'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':['process-v2'],'accessible_storage_ids':list(config['storage']),'runtime':self.runtime},bootstrap=True)
-            self.state.update(data);atomic(self.state_path,self.state)
+            data=self.api.call('/workers/register',self.profile,bootstrap=True)
+            self.state.update(data);self.profile_synced=True;atomic(self.state_path,self.state)
+        else:
+            self.sync_profile()
+
+    def sync_profile(self):
+        if not getattr(self,'profile',None) or not self.state.get('worker_id'): return False
+        with self.lock:
+            try:
+                refreshed=self.api.call('/workers/'+self.state['worker_id']+'/profile',self.profile)
+                if isinstance(refreshed,dict) and type(refreshed.get('version')) is int:
+                    self.sequence=max(self.sequence,refreshed['version'])
+                self.state['sequence']=self.sequence;atomic(self.state_path,self.state)
+                self.profile_synced=True
+                return True
+            except APIError as error:
+                if error.code in (404,405,429) or 500<=error.code<600:
+                    self.profile_synced=False
+                    return False
+                raise
+            except OSError:
+                self.profile_synced=False
+                return False
+
 
     def ref(self,ref):
         spec=self.config['storage'][ref['storage_id']];root=Path(spec['path']).resolve()
@@ -106,8 +130,13 @@ class Agent:
 
     def heartbeat(self):
         with self.lock:
+            if not getattr(self,'profile_synced',True):
+                self.sync_profile()
             self.sequence+=1
             body={'sequence':self.sequence,'runtime':self.runtime,'stage':self.state.get('stage','Idle'),'last_progress_at':self.last_progress,'local_state':{'task_id':self.assignment['task']['id'] if self.assignment else None,'attempt_id':self.assignment['attempt']['id'] if self.assignment else None,'acknowledged_sequence':self.state.get('event_sequence',0)}}
+            if getattr(self,'profile',None):
+                body['capabilities']=list(self.profile['capabilities'])
+                body['accessible_storage_ids']=list(self.profile['accessible_storage_ids'])
             if self.assignment:
                 a=self.assignment['attempt'];body['active']={'attempt_id':a['id'],'lease_token':a['lease_token']}
             result=self.api.call('/workers/'+self.state['worker_id']+'/heartbeat',body)
@@ -180,7 +209,7 @@ class Agent:
         fingerprint=hashlib.sha256(json.dumps({'task':task,'runtime':self.runtime,'effective_parameters':{k:self.config['processor'].get(k) for k in PARAMETERS}},sort_keys=True).encode()).hexdigest()
         if cache_data.get('fingerprint')!=fingerprint: cache_data={'fingerprint':fingerprint,'stages':{}}
         timing=JobTiming(source.name,time.time(),attempt['number']);pipeline.EXECUTION_GUARD=self.guard
-        cfg=dict(self.config['processor']);cfg.update({k:v for k,v in task.get('parameters',{}).items() if k in PARAMETERS});cfg.update(_monitor=self,_timing=timing,_guard=self.guard)
+        cfg=dict(self.config['processor']);cfg.update({k:v for k,v in task.get('parameters',{}).items() if k in PARAMETERS});cfg.update(_monitor=self,_timing=timing,_guard=self.guard,_task_id=task['id'],_attempt_id=attempt['id'])
         result_ref=None;digest=None
         def stage(name,operation,files):
             self.guard();self.state['stage']=name;self.last_progress=time.time();timing.transition(name);self.event('stage_started',name)
@@ -206,17 +235,40 @@ class Agent:
                 if input_ref.get('sha256') and value!=input_ref['sha256']: raise ValueError('source_hash_mismatch')
                 return value
             digest=stage('verify_source',verify,lambda:[local]);timing.digest=digest
+            parameters=task.get('parameters',{})
+            if not isinstance(parameters,dict) or set(parameters)-PARAMETERS-{'cut_constraints_ref'}:raise ValueError('unsupported_task_parameters')
+            from cut_constraints import apply,export_fps_for_source,load,validate_parameter_overrides
+            validate_parameter_overrides({k:v for k,v in parameters.items() if k!='cut_constraints_ref'})
+            constraints_ref=parameters.get('cut_constraints_ref')
+            constraint_payload=None
+            if constraints_ref:
+                self.ref(constraints_ref)  # Verify mounted storage identity before opening the bounded artifact.
+                probed=pipeline.probe(local)
+                constraint_payload=load(self.config['storage']['processing']['path'],constraints_ref,scratch/'feedback-snapshot.json',digest,probed['duration'],export_fps=export_fps_for_source(probed['fps']))
+                snap_overrides=constraint_payload.get('parameter_overrides') or {}
+                if any(k in parameters and parameters[k]!=v for k,v in snap_overrides.items()):
+                    raise ValueError('parameter_override_mismatch')
+                cfg.update(snap_overrides)
+                cfg['_allow_empty_analysis']=True
+
             def prepare():
                 meta,proxy=pipeline.prepare_video(local,scratch,cfg)
                 return meta
             meta=stage('prepare_proxy',prepare,lambda:[scratch/'analysis.mp4'])
             timing.info={k:meta[k] for k in ('duration','width','height','fps','transfer')}
-            analysis=stage('analyze',lambda:list(pipeline.analyze_video(scratch/'analysis.mp4',meta,cfg)),lambda:[])
+            analysis=stage('analyze',lambda:list(pipeline.analyze_video(scratch/'analysis.mp4',meta,cfg)),lambda:[p for p in (scratch/'pose-observations.json',) if p.is_file()])
             out.mkdir(exist_ok=True)
             def process():
                 if out.exists(): shutil.rmtree(out)
                 out.mkdir()
-                return pipeline.render_session(local,out,cfg,digest,source.name,analysis[0],analysis[1],meta)
+                intervals,findings=analysis[0],dict(analysis[1])
+                if constraint_payload is not None:
+                    assembly_findings={}
+                    intervals=apply(intervals,constraint_payload,export_fps=export_fps_for_source(meta['fps']),findings_out=assembly_findings)
+                    findings['cut_constraints']={'schema_version':1,'snapshot_sha256':constraints_ref['sha256'],'base_video_version_id':constraint_payload['base_video_version_id'],
+                                                'base_attempt_id':constraint_payload['base_attempt_id'],'commands':{k:len(v) for k,v in constraint_payload['confirmed_commands'].items()},'applied_after_padding_and_merging':True,
+                                                **assembly_findings}
+                return pipeline.render_session(local,out,cfg,digest,source.name,intervals,findings,meta)
             report=stage('process',process,lambda:list(out.rglob('*')))
             timing.info['clips']=report['clips']
             bundle=scratch/'bundle'
@@ -224,10 +276,13 @@ class Agent:
                 if bundle.exists(): shutil.rmtree(bundle)
                 media=bundle/'media';metadata=bundle/'metadata';media.mkdir(parents=True);metadata.mkdir()
                 _,public=metadata_for_session(out)
-                for name in ['Practice.mp4']+[c['file'] for c in public['clips']]:
+                for name in (['Practice.mp4']+[c['file'] for c in public['clips']] if public['clips'] else []):
                     target=media/name;target.parent.mkdir(parents=True,exist_ok=True);os.link(out/name,target)
-                poster(out,media/'poster.jpg')
+                if public['clips']:poster(out,media/'poster.jpg')
                 for name in public['artifacts']: shutil.copyfile(out/name,metadata/name)
+                if (metadata/'heuristic-diagnostics.json').is_file():
+                    from diagnostics import bind_publication_diagnostics
+                    bind_publication_diagnostics(metadata/'heuristic-diagnostics.json',public,task_id=task['id'],attempt_id=attempt['id'])
                 atomic(metadata/'original-metadata.json',meta)
                 public['artifacts'].append('original-metadata.json')
                 public['media_checksums']={p.relative_to(media).as_posix():checksum(p) for p in media.rglob('*') if p.is_file()}
@@ -235,7 +290,10 @@ class Agent:
                 original=source.stat()
                 if not matches_signature(original,input_ref) or checksum(source)!=digest: raise ValueError('source_changed')
                 atomic(bundle/'result.json',{'schema_version':1,'task_id':task['id'],'attempt_id':attempt['id'],'source_sha256':digest,'session':public,'parameters':task.get('parameters',{}),'pipeline_version':'2.0.0','runtime':self.runtime,'files':[{'path':p.relative_to(bundle).as_posix(),'bytes':p.stat().st_size,'sha256':checksum(p)} for p in bundle.rglob('*') if p.is_file()]})
-                return {'clips':report['clips'],'kept_seconds':report['kept_seconds']}
+                out_findings={'clips':report['clips'],'kept_seconds':report['kept_seconds']}
+                if isinstance(report.get('analysis'),dict) and 'cut_constraints' in report['analysis']:
+                    out_findings['cut_constraints']=report['analysis']['cut_constraints']
+                return out_findings
             # Attempt IDs differ after retries; always refresh manifest packaging.
             cache_data['stages'].pop('package_result',None)
             findings=stage('package_result',package,lambda:list(bundle.rglob('*')))
@@ -292,8 +350,10 @@ class Agent:
                 if self.assignment:
                     try:
                         self.heartbeat();assignment=self.assignment
-                    except APIError:
-                        self.assignment=None
+                    except APIError as exc:
+                        if exc.code in (401,403,404,409):
+                            self.assignment=None;self.persist()
+                        else: raise
                 if not assignment: assignment=self.api.call('/workers/'+self.state['worker_id']+'/claims',{'request_id':uuid.uuid4().hex})
                 if assignment: self.execute(assignment)
                 elif once: return
@@ -320,6 +380,10 @@ def worker_lock(path):
                 stream.seek(0);msvcrt.locking(stream.fileno(),msvcrt.LK_UNLCK,1)
 
 
+def is_transient_api_error(exc):
+    return isinstance(exc,APIError) and (exc.code==429 or 500<=exc.code<600)
+
+
 def run_supervised(config, once=False, sleep=time.sleep):
     # A short-lived launch agent can disappear before macOS displays its local
     # network permission alert. Keep the process alive and recover on reconnect.
@@ -327,8 +391,8 @@ def run_supervised(config, once=False, sleep=time.sleep):
         try:
             Agent(config).run(once)
             return
-        except OSError:
-            if once: raise
+        except (OSError,APIError) as exc:
+            if once or (isinstance(exc,APIError) and not is_transient_api_error(exc)): raise
             LOG.warning('Server connection unavailable; keeping worker alive and retrying in 15 seconds')
             sleep(15)
 

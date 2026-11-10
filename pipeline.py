@@ -121,8 +121,8 @@ def prepare_video(source, scratch, cfg):
 
 def analyze_video(proxy, meta, cfg):
     intervals, analysis = detect(proxy, cfg)
-    if not intervals: raise RuntimeError("No practice motion detected. Original preserved; check camera framing or detector settings.")
-    if analysis["target_visible_fraction"] < 0.10: raise RuntimeError("Near player visible in fewer than 10% of frames; camera profile needs adjustment")
+    if not intervals and not cfg.get("_allow_empty_analysis"): raise RuntimeError("No practice motion detected. Original preserved; check camera framing or detector settings.")
+    if analysis["target_visible_fraction"] < 0.10 and not cfg.get("_allow_empty_analysis"): raise RuntimeError("Near player visible in fewer than 10% of frames; camera profile needs adjustment")
     return [[a, min(b, meta["duration"])] for a, b in intervals if a < meta["duration"]], analysis
 
 
@@ -154,28 +154,57 @@ def render_session(source, out, cfg, digest, original_name, intervals, analysis,
         run_media(["-ss", f"{start:.6f}", "-i", str(source), "-t", f"{end-start:.6f}", "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1", "-vf", f"scale=trunc(iw/2)*2:trunc(ih/2)*2,fps={fps}," + color_filters] + encoder_args + ["-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-metadata", f"creation_time={meta['recorded_at']}", str(path)], log)
         verify_video(path, end - start, log)
         verify_color(meta, probe(path))
-    progress(cfg, "Combining clips")
-    concat = out / "concat.txt"
-    concat.write_text("".join(f"file 'Clips/clip-{i:03d}.mp4'\n" for i in range(1, len(intervals)+1)))
-    combined = out / "Practice.mp4"
-    run_media(["-f", "concat", "-safe", "1", "-i", str(concat), "-c", "copy", "-movflags", "+faststart", str(combined)], log)
+    if intervals:
+        progress(cfg, "Combining clips")
+        concat = out / "concat.txt"
+        concat.write_text("".join(f"file 'Clips/clip-{i:03d}.mp4'\n" for i in range(1, len(intervals)+1)))
+        combined = out / "Practice.mp4"
+        run_media(["-f", "concat", "-safe", "1", "-i", str(concat), "-c", "copy", "-movflags", "+faststart", str(combined)], log)
+        kept = sum(b-a for a, b in intervals)
+        # AAC packet rounding accumulates across joined clips, so use measured durations.
+        expected_join = sum(probe(p)["duration"] for p in sorted(clips.glob("*.mp4")))
+        progress(cfg, "Verifying combined video")
+        verify_video(combined, expected_join, log)
+        verify_color(meta, probe(combined))
+        concat.unlink()
     kept = sum(b-a for a, b in intervals)
-    # AAC packet rounding accumulates across joined clips, so use measured durations.
-    expected_join = sum(probe(p)["duration"] for p in sorted(clips.glob("*.mp4")))
-    progress(cfg, "Verifying combined video")
-    verify_video(combined, expected_join, log)
-    verify_color(meta, probe(combined))
-    concat.unlink()
     with (out / "timestamps.csv").open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["clip", "original_start_seconds", "original_end_seconds"])
         writer.writerows((f"clip-{i:03d}.mp4", f"{a:.3f}", f"{b:.3f}") for i, (a, b) in enumerate(intervals, 1))
-    report = {"source": original_name, "source_sha256": digest, "source_metadata": meta, "kept_seconds": round(kept, 3), "removed_seconds": round(meta["duration"]-kept, 3), "clips": len(intervals), "intervals": intervals, "analysis": analysis, "processing_seconds": round(time.monotonic()-started, 1), "settings": {k: cfg[k] for k in ("target_region", "min_player_height", "swing_speed", "arm_reach", "padding_before", "padding_after", "merge_gap") if k in cfg}}
+    from diagnostics import build_heuristic_diagnostics, load_local_observations
+    from publication import public_session
+    raw_analysis = dict(analysis or {})
+    inline_observations = raw_analysis.pop("_frame_observations", None) or cfg.get("_frame_observations")
+    inline_records = raw_analysis.pop("pose_records", None) or raw_analysis.pop("_pose_records", None) or cfg.get("pose_records")
+    local_observations, local_proxy_meta = load_local_observations(out.parent / "pose-observations.json")
+    if local_proxy_meta and "proxy_observation_meta" not in raw_analysis:
+        raw_analysis["proxy_observation_meta"] = local_proxy_meta
+    analysis_for_diag = dict(raw_analysis)
+    if inline_records is not None:
+        analysis_for_diag["pose_records"] = inline_records
+    published_at = time.time()
+    report = {"source": original_name, "source_sha256": digest, "source_metadata": meta, "published_at": published_at, "kept_seconds": round(kept, 3), "removed_seconds": round(meta["duration"]-kept, 3), "clips": len(intervals), "intervals": intervals, "analysis": raw_analysis, "processing_seconds": round(time.monotonic()-started, 1), "settings": {k: cfg[k] for k in ("target_region", "min_player_height", "swing_speed", "arm_reach", "padding_before", "padding_after", "merge_gap") if k in cfg}}
     report["encoding"] = encoding
     progress(cfg, "Aligning playback chapters")
-    report["playback"] = build_playback(out, intervals)
+    report["playback"] = build_playback(out, intervals) if intervals else {"duration_seconds":0,"alignment":"empty-candidate-no-media","clips":[]}
     progress(cfg, "Writing timeline and checksums")
     write_review(out, report)
+    report["heuristic_diagnostics"] = "heuristic-diagnostics.json"
+    frozen_public = public_session(report, report["playback"])
+    diagnostics_payload = build_heuristic_diagnostics(
+        source_sha256=digest,
+        duration_seconds=meta["duration"],
+        intervals=intervals,
+        cfg=cfg,
+        meta=meta,
+        analysis=analysis_for_diag,
+        frame_observations=inline_observations if inline_observations is not None else local_observations,
+        public=frozen_public,
+        task_id=cfg.get("_task_id"),
+        attempt_id=cfg.get("_attempt_id"),
+    )
+    atomic_json(out / "heuristic-diagnostics.json", diagnostics_payload)
     report["output_checksums"] = {str(p.relative_to(out)): sha256(p) for p in out.rglob("*") if p.is_file()}
     atomic_json(out / "session.json", report)
     return report
@@ -193,4 +222,6 @@ def write_review(out, report):
                      '<div style="overflow-x:auto"><table><thead><tr><th>Action</th><th>Original start</th><th>Original end</th><th>Duration</th><th>Clip</th></tr></thead><tbody>'
                      + timeline_rows + '</tbody></table></div><p><a href="edit-timeline.csv">Download timeline CSV</a> · <a href="edit-timeline.json">Timeline JSON</a></p>')
     rows = "".join(f'<li><a href="Clips/clip-{i:03d}.mp4">Clip {i}</a><span>Original {a:.1f}–{b:.1f} seconds</span></li>' for i, (a, b) in enumerate(report["intervals"], 1))
-    (out / "Review.html").write_text('''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tennis practice review</title><style>body{font:17px system-ui;background:#101c24;color:#edf3f4;max-width:1000px;margin:40px auto;padding:0 24px}h1{font-size:36px}video{width:100%;border-radius:12px;background:#000}a{color:#b5ed83}p,span{color:#b8c9cf}ul{padding:0;list-style:none}li{display:flex;justify-content:space-between;padding:16px;border-bottom:1px solid #34454c}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:10px;border-bottom:1px solid #34454c;white-space:nowrap}.badge{color:#b5ed83;letter-spacing:.12em;font-size:12px}</style><div class="badge">TENNIS · PRACTICE REVIEW</div><h1>''' + html.escape(Path(report["source"]).stem) + f'''</h1><p>{report['kept_seconds']:.0f} seconds retained · {report['removed_seconds']:.0f} seconds removed · {report['clips']} clips</p><video controls preload="metadata" src="Practice.mp4"></video><p>Automatic practice cut. Includes preparation and recovery around detected movement. May retain non-playing activity or miss strokes; the original remains available.</p><ul>''' + rows + '</ul>' + timeline_html + '<p><a href="timestamps.csv">Original timestamps</a></p></html>')
+    review_html=('''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tennis practice review</title><style>body{font:17px system-ui;background:#101c24;color:#edf3f4;max-width:1000px;margin:40px auto;padding:0 24px}h1{font-size:36px}video{width:100%;border-radius:12px;background:#000}a{color:#b5ed83}p,span{color:#b8c9cf}ul{padding:0;list-style:none}li{display:flex;justify-content:space-between;padding:16px;border-bottom:1px solid #34454c}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:10px;border-bottom:1px solid #34454c;white-space:nowrap}.badge{color:#b5ed83;letter-spacing:.12em;font-size:12px}</style><div class="badge">TENNIS · PRACTICE REVIEW</div><h1>''' + html.escape(Path(report["source"]).stem) + f'''</h1><p>{report['kept_seconds']:.0f} seconds retained · {report['removed_seconds']:.0f} seconds removed · {report['clips']} clips</p><video controls preload="metadata" src="Practice.mp4"></video><p>Automatic practice cut. Includes preparation and recovery around detected movement. May retain non-playing activity or miss strokes; the original remains available.</p><ul>''' + rows + '</ul>' + timeline_html + '<p><a href="timestamps.csv">Original timestamps</a></p></html>')
+    if not report["clips"]:review_html=review_html.replace('<video controls preload="metadata" src="Practice.mp4"></video>', '<p>No retained clips.</p>')
+    (out / "Review.html").write_text(review_html)

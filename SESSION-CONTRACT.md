@@ -30,3 +30,41 @@ Supported transport today is a filesystem mounted outside the application, optio
 Original iPhone location metadata retains latitude, longitude, and optional
 `altitude_m` when present. The website owns saved court names and matching rules;
 those do not rename original recordings or rewrite video media.
+
+## Worker heuristic diagnostics (`heuristic-diagnostics.json`)
+
+New processing outputs emit `heuristic-diagnostics.json` alongside session metadata
+(listed in `artifacts` and verified in `metadata_checksums` / `output_checksums`, capped at
+`<= 512 KiB` and `<= 5` ranked hints per clip or removed gap). Existing publications
+without `heuristic-diagnostics.json` remain valid.
+
+Dense frame-by-frame pose observations (`pose-observations.json`) remain in local worker
+scratch/cache only and are never published to NAS.
+
+Key invariants and fields:
+- `schema_version`: `1`.
+- `source_sha256`: 64-hex original content hash; `source_duration_ms` and `source_duration_seconds`.
+- `task_id`, `attempt_id`, `video_version_id` (`v_<32-hex>` compact JSON hash over frozen publication identity), `published_at` (bound only after `public_session` generation is frozen).
+- `extraction_cache_key`: 64-hex SHA-256 over the complete upstream extraction tuple (`source_sha256`, `proxy_spec` with actual `target_fps: 8.0`, dimensions, rotation, transfer, and `pts_timebase`, `detector_spec`, `extractor_code_digest`, and `roi_and_filter_config`).
+- `truth_status`: `"heuristic_only_not_play_or_swing_truth"` and `training_label_status`: `"not_released"`. `generator` explicitly sets `benchmark_truth: false`, `verified_play_or_swing: false`, `verified_player_identity: false`.
+- `provenance`: full model, 8 fps proxy, timebase, software/module digest, and ROI/target-selection configuration. Task stage checkpoints are task-local recovery only, not cross-rerun observation cache reuse.
+- `publication`: frozen `public_session` linkage (`session_id`, `published_at`, `media_directory`, `algorithm`, `chapter_alignment`, `combined_duration_seconds`, `clip_count`, `clip_ids`, `task_id`, `attempt_id`, `video_version_id`, `version_payload_sha256`).
+- `limits` and `omitted_hints_count`: explicit cap metadata (`max_hints_per_clip: 5`, `max_hints_per_gap: 5`, `max_artifact_bytes: 524288`, `omitted_clip_hints_count`, `omitted_gap_hints_count`, `omitted_hints_count`, `hints_truncated`).
+- `clips`: ordered kept-clip summaries (`clip_id`, `clip_index`, `file`, `original_start_ms`, `original_end_ms`, `heuristic_status`, `identity_status`, `person_presence_ratio`, `active_motion_ratio`, `ambiguous_multi_person_ratio`, `observed_frame_count`, `hints`, `total_candidate_hints`, `omitted_hints_count`, `hints_truncated`).
+- `removed_gaps`: ordered removed-gap summaries (`gap_id`, `gap_index`, `original_start_ms`, `original_end_ms`, `heuristic_status`, `identity_status`, ratios, `hints`, `total_candidate_hints`, `omitted_hints_count`, `hints_truncated`).
+- Allowed `heuristic_status`: `"no_detector_warnings"`, `"check_boundary_activity"`, `"extended_low_motion"`, `"person_track_interrupted"`, `"ambiguous_multiple_persons"`, `"unknown"`.
+- Allowed `identity_status`: `"unverified_single_primary_track"`, `"ambiguous_multiple_persons"`, `"no_person_detected"`, `"unknown"`.
+- Every hint satisfies `parent.original_start_ms <= hint.original_start_ms < hint.original_end_ms <= parent.original_end_ms <= source_duration_ms`.
+
+
+## Feedback-guided candidates
+
+API workers advertise `cut-constraints-v1` and refresh their authenticated profile while retaining the installed worker identity. Old servers without the profile endpoint remain compatible; an authentication failure is not treated as registration permission. Runtime build digests include the constraints and diagnostics modules.
+
+`parameters.cut_constraints_ref` points to a server-owned immutable JSON artifact in processing storage. The worker reads at most 256 KiB, verifies bytes/hash, rejects symlinks and traversal, and keeps a verified local copy for retries. The artifact embeds the verified base manifest and selected evidence revisions. Source SHA, frozen version/attempt, duration, command intervals and contradictions are checked again locally.
+
+Commands run after detector padding and merging. Overrides replace the union of old/new base span and preserve exact new clip edges even if the current detector produced different cuts. Explicit keep ranges are retained; hard excludes are subtracted last and never bridged by a later merge. These commands are operator choices, not training truth. An all-exclude result is metadata-only, with no video or poster. It may be staged for comparison, but cannot become serving output. Dryrun retains all generated artifacts locally and publishes no NAS media/result bundle.
+
+The common video-version ID is `v_` plus the first 32 hex characters of SHA256(compact JSON `[source_sha256, float(published_at)]`). A separate descriptor digest is provenance, not the version identity. Public metadata checksums cover the frozen diagnostics artifact.
+
+Constraint overrides must overlap their own base clip and cannot overlap another base clip; use confirmed keep/exclude ranges for edits spanning multiple cuts. Confirmed keep/override intervals shorter than an export frame fail before rendering. Unforced detector remnants shorter than an export frame are omitted with assembly findings; excludes are never restored. Export-frame size follows the existing 30/60fps export choice. Capability synchronization retries after an older/offline server, and the supervisor retries transient HTTP failures without treating authentication errors as new-worker registration.
