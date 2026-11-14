@@ -367,3 +367,19 @@ def test_worker_fail_payload_redacts_secrets_and_paths(tmp_path,monkeypatch):
     msg=calls[-1][1]['message']
     for secret in ('AIzaLeakyKey123456','TopSecretToken999','secret999','/private/sample/secret.json'):
         assert secret not in msg
+
+
+def test_disabled_ai_explicitly_clears_model_advertisements(tmp_path, monkeypatch):
+    import api_worker
+    calls = []
+    def call(self, path, body=None, **kwargs):
+        calls.append((path, body))
+        return {'worker_id': 'synthetic-worker', 'worker_token': 'synthetic-token'} if path.endswith('/register') else {}
+    monkeypatch.setattr(api_worker.API, 'call', call)
+    agent = api_worker.Agent({'name':'Synthetic worker','state_dir':str(tmp_path/'state'),
+                              'storage':{},'processor':{},'ai':{'enabled':False}})
+    agent.heartbeat()
+    for _, body in calls:
+        assert body['ai_models'] == [] and body['ai_providers'] == []
+        assert body['default_ai_model'] is None
+        assert 'hybrid-ai-vision-v1' not in body['capabilities']

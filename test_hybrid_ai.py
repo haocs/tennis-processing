@@ -704,3 +704,59 @@ def test_ai_findings_32kib_cap_and_lossless_ai_provenance_artifact(tmp_path):
     diag = json.loads((out / "heuristic-diagnostics.json").read_text())
     assert diag["provenance"]["software"]["detector_version"] == hybrid_ai.VERSION
     assert diag["provenance"]["cut_assembly_config"]["padding_before"] == 0.2
+
+
+def test_provider_wire_contracts_and_codex_subscription_isolation(tmp_path, monkeypatch):
+    """Verify actual request formats rather than only parsed mocked decisions."""
+    schema = hybrid_ai.DECISION_JSON_SCHEMA
+    decision = schema['properties']['decisions']['items']
+    assert set(decision['required']) == set(decision['properties'])
+    for key in ('trimmed_start_s', 'trimmed_end_s'):
+        assert decision['properties'][key]['type'] == ['number', 'null']
+    sheet = tmp_path / 'sheet.jpg'
+    Image.new('RGB', (32, 32), 'green').save(sheet)
+    batch = [dict(candidate_id='C001', start_s=0.0, end_s=2.0, duration_s=2.0,
+                  event_count=1, active_ratio=0.5, sheet_path=str(sheet), sheet_sha256='a'*64)]
+    response = {'decisions': [dict(candidate_id='C001', action='keep', category='rally',
+                                  confidence=0.9, reason='Synthetic', trimmed_start_s=None, trimmed_end_s=None)]}
+    monkeypatch.setenv('OPENAI_API_KEY', 'synthetic-unwanted-api-key')
+    monkeypatch.setenv('CODEX_API_KEY', 'synthetic-unwanted-api-key')
+    calls = []
+
+    def invoke(cmd, **kw):
+        calls.append(cmd)
+        if 'exec' in cmd:
+            assert '--ignore-user-config' in cmd and '--ephemeral' in cmd and 'read-only' in cmd
+            assert cmd[-1] == '-' and b'Response JSON Schema' in kw['stdin_bytes']
+            assert not any(k in kw['env'] for k in ('OPENAI_API_KEY', 'CODEX_API_KEY'))
+            for feature in ('shell_tool', 'unified_exec', 'apps', 'plugins', 'browser_use', 'computer_use', 'in_app_browser', 'code_mode'):
+                assert any(cmd[i:i+2] == ['--disable', feature] for i in range(len(cmd)-1))
+            assert json.loads(Path(cmd[cmd.index('--output-schema')+1]).read_text()) == schema
+            Path(cmd[cmd.index('-o')+1]).write_text(json.dumps(response))
+            return 0, b'', b''
+        if '--gemini-http' in cmd:
+            payload = json.loads(kw['stdin_bytes'])['payload']['generationConfig']
+            assert payload['response_json_schema'] == schema and 'response_schema' not in payload
+            return 0, json.dumps({'candidates':[{'content':{'parts':[{'text':json.dumps(response)}]}}]}).encode(), b''
+        assert '--sandbox' in cmd and '--json-schema' in cmd and '-p' in cmd
+        assert '@C001.jpg' in cmd[-1] and hybrid_ai._canonical_json(schema) in cmd[-1]
+        return 0, json.dumps({'status':'SUCCESS', 'structured_output':response}).encode(), b''
+
+    monkeypatch.setattr(hybrid_ai, '_run_guarded_subprocess', invoke)
+    for model in ('codex:default', 'gemini:synthetic-model', 'antigravity:synthetic-model'):
+        actual, _, _ = hybrid_ai._invoke_provider_batch(
+            model, batch, 'fast', {}, {'gemini_api_key':'synthetic-key'},
+            {'codex_bin':'synthetic-codex', 'antigravity_bin':'synthetic-agy'})
+        assert actual == response
+    assert len(calls) == 3
+
+
+def test_antigravity_current_tab_separated_model_catalog():
+    models = hybrid_ai._parse_agy_models_output("gemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)\ngemini-3.8-flash-low\tGemini Flash (Low)\n")
+    assert [m["id"] for m in models] == ["antigravity:gemini-4-hydrogen-low", "antigravity:gemini-3.8-flash-low"]
+
+
+def test_malformed_wrapped_json_remains_fallback_eligible():
+    with pytest.raises(hybrid_ai.ProviderCallError) as exc:
+        hybrid_ai._extract_json_object("Model output: {broken JSON}")
+    assert exc.value.error_code == "invalid_ai_response_json"

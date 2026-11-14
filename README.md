@@ -148,7 +148,7 @@ enabled per task when the worker configures `"ai": {"enabled": true, ...}` in
 `api-worker.json`. The worker advertises discovered models from configured local
 providers (`antigravity`, `gemini`, `codex`) and honors per-task `ai_model`,
 `allow_model_fallback`, and `ai_tuning` overrides, emitting `ai-provenance.json`
-without uploading raw frames or prompts. Raw pose outputs cache locally under
+without uploading raw frames or prompts. Worker 2.1.0 uses the noninteractive Antigravity print interface and ChatGPT-signed-in Codex with explicit stdin/image inputs; provider schemas are validated before applying decisions. AI remains opt-in per task; existing watchers keep vision-only behavior unless explicitly changed. Raw pose outputs cache locally under
 `<state_dir>/cache/pose` while per-task `pose-observations.json` and AI decisions
 recompute cleanly when tuning parameters change.
 

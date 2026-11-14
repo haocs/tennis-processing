@@ -85,11 +85,11 @@ class Agent:
         import platform
         self.ai_profile=discover_worker_ai_profile(config)
         capabilities=['process-v2','cut-constraints-v1','heuristic-diagnostics-v1']+list(self.ai_profile.get('capabilities_extra',[]))
-        self.profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':capabilities,'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
-        if self.ai_profile.get('ai_models'):
-            self.profile['ai_providers']=list(self.ai_profile['ai_providers'])
-            self.profile['ai_models']=list(self.ai_profile['ai_models'])
-            self.profile['default_ai_model']=self.ai_profile['default_ai_model']
+        self.profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.1.0','capabilities':capabilities,'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
+        # Explicit empty fields remove obsolete model advertisements when AI is disabled.
+        self.profile['ai_providers']=list(self.ai_profile.get('ai_providers') or [])
+        self.profile['ai_models']=list(self.ai_profile.get('ai_models') or [])
+        self.profile['default_ai_model']=self.ai_profile.get('default_ai_model')
         self.profile_synced=False
         if not self.state.get('worker_id'):
             data=self.api.call('/workers/register',self.profile,bootstrap=True)

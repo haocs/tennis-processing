@@ -46,7 +46,7 @@ AI_ACCURACY_TIERS = ("fast", "standard", "thorough")
 AI_PROVIDERS = ("antigravity", "gemini", "codex")
 AI_MODEL_RE = re.compile(r"^(antigravity|gemini|codex):[A-Za-z0-9._-]{1,64}$")
 MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-AGY_LINE_RE = re.compile(r"^([a-z0-9][a-z0-9._-]{1,63})\s{2,}(.+)$")
+AGY_LINE_RE = re.compile(r"^([a-z0-9][a-z0-9._-]{1,63})(?:\t+| {2,})(.+)$")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 ALLOWED_ACTIONS = ("keep", "trim", "drop")
@@ -109,15 +109,15 @@ DECISION_JSON_SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["candidate_id", "action", "category", "confidence", "reason"],
+                "required": ["candidate_id", "action", "category", "confidence", "reason", "trimmed_start_s", "trimmed_end_s"],
                 "properties": {
                     "candidate_id": {"type": "string"},
                     "action": {"type": "string", "enum": list(ALLOWED_ACTIONS)},
                     "category": {"type": "string", "enum": list(ALLOWED_CATEGORIES)},
                     "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                     "reason": {"type": "string"},
-                    "trimmed_start_s": {"type": "number"},
-                    "trimmed_end_s": {"type": "number"},
+                    "trimmed_start_s": {"type": ["number", "null"]},
+                    "trimmed_end_s": {"type": ["number", "null"]},
                 },
             },
         }
@@ -1044,6 +1044,9 @@ def _build_batch_prompt(batch: list[dict], batch_dir: Path, tier: str, include_f
         "- action: keep (tennis play fills the candidate), trim (part is real tennis play and part is dead time/walking/pickup; set trimmed_start_s and trimmed_end_s inside candidate bounds), drop (no actual stroke/rally/serve)",
         "Only use category=uncertain if frames are ambiguous; do not invent strokes you cannot see.",
         "Return ONLY valid JSON matching the required schema with one entry per candidate_id.",
+        "Include trimmed_start_s and trimmed_end_s on every decision; use null for keep/drop.",
+        "Response JSON Schema:",
+        _canonical_json(DECISION_JSON_SCHEMA),
         "Candidates JSON:",
         json.dumps(manifest, separators=(",", ":"), allow_nan=False),
     ]
@@ -1064,9 +1067,12 @@ def _extract_json_object(raw_text: str) -> dict:
     first = cleaned.find("{")
     last = cleaned.rfind("}")
     if first != -1 and last > first:
-        parsed = json.loads(cleaned[first : last + 1])
-        if isinstance(parsed, dict):
-            return parsed
+        try:
+            parsed = json.loads(cleaned[first : last + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
     raise ProviderCallError("invalid_ai_response_json", "AI provider returned non-JSON output")
 
 
@@ -1125,16 +1131,29 @@ def _invoke_provider_batch(
             )
             if not agy_bin:
                 raise ProviderCallError("provider_unavailable", "Antigravity CLI binary unavailable")
-            prompt_parts = [prompt_text, "Inspect attached image files: " + ", ".join(f"{c['candidate_id']}.jpg" for c in batch)]
-            cmd = [agy_bin, "agent", "--model", model_name]
+            schema_file = batch_dir / "decision-schema.json"
+            schema_file.write_text(_canonical_json(DECISION_JSON_SCHEMA), encoding="utf-8")
+            refs = " ".join("@" + c["candidate_id"] + ".jpg" for c in batch)
+            prompt = (f"Attached contact sheets: {refs}\n"
+                      "Inspect only these images. Do not run shell commands or modify files.\n" + prompt_text)
+            cmd = [agy_bin, "--sandbox", "--disable-slash-commands", "--output-format", "json",
+                   "--print-timeout", f"{timeout_s:g}s", "--model", model_name,
+                   "--json-schema", str(schema_file)]
             if _model_supports_effort(model_name):
                 cmd.extend(["--effort", TIER_CONFIG[tier]["effort"]])
-            cmd.extend(["--", "\n".join(prompt_parts)])
-            rc, stdout_b, stderr_b = _run_guarded_subprocess(cmd, cwd=str(batch_dir), timeout_s=timeout_s, guard=guard)
+            cmd.extend(["-p", prompt])
+            env = os.environ.copy()
+            for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+                env.pop(key, None)
+            rc, stdout_b, stderr_b = _run_guarded_subprocess(cmd, cwd=str(batch_dir), env=env, timeout_s=timeout_s, guard=guard)
             if rc != 0:
                 raise ProviderCallError("provider_cli_failed", sanitize_error_message(stderr_b.decode("utf-8", errors="replace") or f"exit {rc}"))
-            parsed = _extract_json_object(stdout_b.decode("utf-8", errors="replace"))
-            return parsed, prompt_sha256, input_manifest_sha256
+            envelope = _extract_json_object(stdout_b.decode("utf-8", errors="replace"))
+            if str(envelope.get("status", "")).upper() != "SUCCESS":
+                raise ProviderCallError("provider_cli_failed", envelope.get("error") or "Antigravity request did not succeed")
+            if isinstance(envelope.get("structured_output"), dict):
+                return envelope["structured_output"], prompt_sha256, input_manifest_sha256
+            return _extract_json_object(str(envelope.get("response") or "")), prompt_sha256, input_manifest_sha256
 
         if provider == "codex":
             codex_bin = provider_runtime.get("codex_bin") or _resolve_binary(
@@ -1149,6 +1168,7 @@ def _invoke_provider_batch(
             cmd = [
                 codex_bin,
                 "exec",
+                "--ignore-user-config",
                 "--ephemeral",
                 "--skip-git-repo-check",
                 "-s",
@@ -1160,12 +1180,18 @@ def _invoke_provider_batch(
                 "-o",
                 str(out_file),
             ]
+            for feature in ("shell_tool", "unified_exec", "apps", "plugins", "browser_use", "computer_use", "in_app_browser", "code_mode"):
+                cmd.extend(["--disable", feature])
             if model_name != "default":
                 cmd.extend(["--model", model_name])
             for cand in batch:
                 cmd.extend(["-i", str(batch_dir / f"{cand['candidate_id']}.jpg")])
-            cmd.append(prompt_text)
-            rc, stdout_b, stderr_b = _run_guarded_subprocess(cmd, cwd=str(batch_dir), timeout_s=timeout_s, guard=guard)
+            # Image arguments are variadic; pass the prompt through stdin explicitly.
+            cmd.append("-")
+            env = os.environ.copy()
+            for key in ("OPENAI_API_KEY", "CODEX_API_KEY"):
+                env.pop(key, None)
+            rc, stdout_b, stderr_b = _run_guarded_subprocess(cmd, cwd=str(batch_dir), env=env, stdin_bytes=prompt_text.encode("utf-8"), timeout_s=timeout_s, guard=guard)
             if rc != 0:
                 raise ProviderCallError("provider_cli_failed", sanitize_error_message(stderr_b.decode("utf-8", errors="replace") or f"exit {rc}"))
             raw_text = out_file.read_text(encoding="utf-8") if out_file.is_file() else stdout_b.decode("utf-8", errors="replace")
@@ -1189,7 +1215,7 @@ def _invoke_provider_batch(
                 "contents": [{"parts": parts}],
                 "generationConfig": {
                     "response_mime_type": "application/json",
-                    "response_schema": DECISION_JSON_SCHEMA,
+                    "response_json_schema": DECISION_JSON_SCHEMA,
                     "temperature": 0.1,
                 },
             }
