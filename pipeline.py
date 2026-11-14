@@ -120,6 +120,21 @@ def prepare_video(source, scratch, cfg):
 
 
 def analyze_video(proxy, meta, cfg):
+    from hybrid_ai import ProcessingTaskError, run_hybrid_ai_analysis
+    strategy = cfg.get("processing_strategy", "vision_only")
+    if strategy == "ai_only":
+        raise ProcessingTaskError("unsupported_processing_strategy", "Strategy ai_only is not yet supported.")
+    if strategy == "hybrid_ai_vision":
+        intervals, analysis = run_hybrid_ai_analysis(proxy, meta, cfg)
+        if not intervals and not cfg.get("_allow_empty_analysis") and not cfg.get("_defer_empty_check"):
+            raise ProcessingTaskError(
+                "no_play_detected_after_ai_filter",
+                "AI filter retained zero play clips; original preserved.",
+                retryable=False,
+            )
+        if intervals and analysis["target_visible_fraction"] < 0.10 and not cfg.get("_allow_empty_analysis"):
+            raise RuntimeError("Near player visible in fewer than 10% of frames; camera profile needs adjustment")
+        return [[a, min(b, meta["duration"])] for a, b in intervals if a < meta["duration"]], analysis
     intervals, analysis = detect(proxy, cfg)
     if not intervals and not cfg.get("_allow_empty_analysis"): raise RuntimeError("No practice motion detected. Original preserved; check camera framing or detector settings.")
     if analysis["target_visible_fraction"] < 0.10 and not cfg.get("_allow_empty_analysis"): raise RuntimeError("Near player visible in fewer than 10% of frames; camera profile needs adjustment")
@@ -177,6 +192,7 @@ def render_session(source, out, cfg, digest, original_name, intervals, analysis,
     raw_analysis = dict(analysis or {})
     inline_observations = raw_analysis.pop("_frame_observations", None) or cfg.get("_frame_observations")
     inline_records = raw_analysis.pop("pose_records", None) or raw_analysis.pop("_pose_records", None) or cfg.get("pose_records")
+    ai_prov = raw_analysis.pop("_ai_provenance_payload", None)
     local_observations, local_proxy_meta = load_local_observations(out.parent / "pose-observations.json")
     if local_proxy_meta and "proxy_observation_meta" not in raw_analysis:
         raw_analysis["proxy_observation_meta"] = local_proxy_meta
@@ -184,19 +200,47 @@ def render_session(source, out, cfg, digest, original_name, intervals, analysis,
     if inline_records is not None:
         analysis_for_diag["pose_records"] = inline_records
     published_at = time.time()
-    report = {"source": original_name, "source_sha256": digest, "source_metadata": meta, "published_at": published_at, "kept_seconds": round(kept, 3), "removed_seconds": round(meta["duration"]-kept, 3), "clips": len(intervals), "intervals": intervals, "analysis": raw_analysis, "processing_seconds": round(time.monotonic()-started, 1), "settings": {k: cfg[k] for k in ("target_region", "min_player_height", "swing_speed", "arm_reach", "padding_before", "padding_after", "merge_gap") if k in cfg}}
+    settings_keys = (
+        "target_region",
+        "min_player_height",
+        "swing_speed",
+        "arm_reach",
+        "padding_before",
+        "padding_after",
+        "merge_gap",
+        "processing_strategy",
+        "ai_model",
+        "allow_model_fallback",
+        "ai_tuning",
+    )
+    report = {"source": original_name, "source_sha256": digest, "source_metadata": meta, "published_at": published_at, "kept_seconds": round(kept, 3), "removed_seconds": round(meta["duration"]-kept, 3), "clips": len(intervals), "intervals": intervals, "analysis": raw_analysis, "processing_seconds": round(time.monotonic()-started, 1), "settings": {k: cfg[k] for k in settings_keys if k in cfg}}
     report["encoding"] = encoding
     progress(cfg, "Aligning playback chapters")
     report["playback"] = build_playback(out, intervals) if intervals else {"duration_seconds":0,"alignment":"empty-candidate-no-media","clips":[]}
     progress(cfg, "Writing timeline and checksums")
     write_review(out, report)
     report["heuristic_diagnostics"] = "heuristic-diagnostics.json"
+    if ai_prov is not None:
+        from hybrid_ai import bound_ai_refinement_findings
+        prov_payload = {**ai_prov, "provenance_artifact": "ai-provenance.json"}
+        atomic_json(out / "ai-provenance.json", prov_payload)
+        prov_sha = sha256(out / "ai-provenance.json")
+        report["ai_provenance"] = "ai-provenance.json"
+        if isinstance(raw_analysis.get("ai_refinement"), dict):
+            raw_analysis["ai_refinement"] = bound_ai_refinement_findings({
+                **raw_analysis["ai_refinement"],
+                "provenance_artifact": "ai-provenance.json",
+                "provenance_sha256": prov_sha,
+            })
     frozen_public = public_session(report, report["playback"])
+    diag_cfg = dict(cfg)
+    if isinstance(raw_analysis.get("effective_detector_settings"), dict):
+        diag_cfg.update(raw_analysis["effective_detector_settings"])
     diagnostics_payload = build_heuristic_diagnostics(
         source_sha256=digest,
         duration_seconds=meta["duration"],
         intervals=intervals,
-        cfg=cfg,
+        cfg=diag_cfg,
         meta=meta,
         analysis=analysis_for_diag,
         frame_observations=inline_observations if inline_observations is not None else local_observations,

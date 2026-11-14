@@ -1,6 +1,7 @@
 """Portable API worker. Local state is a cache; the server owns leases/history."""
 from __future__ import annotations
 import argparse
+import copy
 import sys
 import subprocess
 import contextlib
@@ -16,8 +17,16 @@ import urllib.error
 import urllib.request
 import uuid
 
+from hybrid_ai import (
+    AI_PARAMETERS,
+    PARAMETERS,
+    ProcessingTaskError,
+    discover_worker_ai_profile,
+    normalize_task_parameters,
+    sanitize_error_message,
+)
+
 LOG=logging.getLogger('tennis.api')
-PARAMETERS={'target_region','min_player_height','swing_speed','arm_reach','padding_before','padding_after','merge_gap'}
 
 
 def atomic(path, value):
@@ -68,13 +77,19 @@ class Agent:
         self.api=API(config,self.state);self.lock=threading.RLock();self.assignment=None;self.last_progress=0;self.failed=None;self.stop=threading.Event();self.next_heartbeat=0
         self.sequence=self.state.get('sequence',0);self.pending=None;self.deadline=None
         code=hashlib.sha256()
-        for name in ('api_worker.py','pipeline.py','detector.py','cut_constraints.py','diagnostics.py','publication.py','color.py','playback.py','timeline.py'):
+        for name in ('api_worker.py','pipeline.py','detector.py','hybrid_ai.py','cut_constraints.py','diagnostics.py','publication.py','color.py','playback.py','timeline.py'):
             code.update((Path(__file__).parent/name).read_bytes())
         model=Path(config.get('processor',{}).get('rallyclip_path',''))/'models/rallyclip_v0.6.0/yolov8n-pose-544x960-static.onnx'
         self.runtime={'executor_version':'2.0.0','build_digest':code.hexdigest(),'model_sha256':checksum(model) if model.is_file() else None,'backend':config.get('processor',{}).get('pose_device','coreml')}
 
         import platform
-        self.profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':['process-v2','cut-constraints-v1','heuristic-diagnostics-v1'],'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
+        self.ai_profile=discover_worker_ai_profile(config)
+        capabilities=['process-v2','cut-constraints-v1','heuristic-diagnostics-v1']+list(self.ai_profile.get('capabilities_extra',[]))
+        self.profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.0.0','capabilities':capabilities,'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
+        if self.ai_profile.get('ai_models'):
+            self.profile['ai_providers']=list(self.ai_profile['ai_providers'])
+            self.profile['ai_models']=list(self.ai_profile['ai_models'])
+            self.profile['default_ai_model']=self.ai_profile['default_ai_model']
         self.profile_synced=False
         if not self.state.get('worker_id'):
             data=self.api.call('/workers/register',self.profile,bootstrap=True)
@@ -137,6 +152,10 @@ class Agent:
             if getattr(self,'profile',None):
                 body['capabilities']=list(self.profile['capabilities'])
                 body['accessible_storage_ids']=list(self.profile['accessible_storage_ids'])
+                if 'ai_models' in self.profile:
+                    body['ai_providers']=list(self.profile.get('ai_providers') or [])
+                    body['ai_models']=list(self.profile.get('ai_models') or [])
+                    body['default_ai_model']=self.profile.get('default_ai_model')
             if self.assignment:
                 a=self.assignment['attempt'];body['active']={'attempt_id':a['id'],'lease_token':a['lease_token']}
             result=self.api.call('/workers/'+self.state['worker_id']+'/heartbeat',body)
@@ -206,10 +225,11 @@ class Agent:
         scratch=self.root/'tasks'/task['id'];scratch.mkdir(parents=True,exist_ok=True)
         input_ref=task['input'];source=self.ref(input_ref);local=scratch/('source'+source.suffix.lower());out=scratch/'result'
         cache=scratch/'checkpoints.json';cache_data=json.loads(cache.read_text()) if cache.exists() else {}
-        fingerprint=hashlib.sha256(json.dumps({'task':task,'runtime':self.runtime,'effective_parameters':{k:self.config['processor'].get(k) for k in PARAMETERS}},sort_keys=True).encode()).hexdigest()
+        ai_profile=getattr(self,'ai_profile',{'ai_models':[],'default_ai_model':None})
+        fingerprint=hashlib.sha256(json.dumps({'task':task,'runtime':self.runtime,'ai_profile':{'ai_models':ai_profile.get('ai_models',[]),'default_ai_model':ai_profile.get('default_ai_model')},'effective_parameters':{k:self.config.get('processor',{}).get(k) for k in PARAMETERS}},sort_keys=True).encode()).hexdigest()
         if cache_data.get('fingerprint')!=fingerprint: cache_data={'fingerprint':fingerprint,'stages':{}}
         timing=JobTiming(source.name,time.time(),attempt['number']);pipeline.EXECUTION_GUARD=self.guard
-        cfg=dict(self.config['processor']);cfg.update({k:v for k,v in task.get('parameters',{}).items() if k in PARAMETERS});cfg.update(_monitor=self,_timing=timing,_guard=self.guard,_task_id=task['id'],_attempt_id=attempt['id'])
+        cfg=dict(self.config.get('processor',{}));cfg.update(_monitor=self,_timing=timing,_guard=self.guard,_task_id=task['id'],_attempt_id=attempt['id'],_state_dir=str(self.root),_runtime=self.runtime,_ai_profile=ai_profile,_ai_config=self.config.get('ai') or {})
         result_ref=None;digest=None
         def stage(name,operation,files):
             self.guard();self.state['stage']=name;self.last_progress=time.time();timing.transition(name);self.event('stage_started',name)
@@ -235,21 +255,46 @@ class Agent:
                 if input_ref.get('sha256') and value!=input_ref['sha256']: raise ValueError('source_hash_mismatch')
                 return value
             digest=stage('verify_source',verify,lambda:[local]);timing.digest=digest
+            cfg['_source_sha256']=digest
             parameters=task.get('parameters',{})
             if not isinstance(parameters,dict) or set(parameters)-PARAMETERS-{'cut_constraints_ref'}:raise ValueError('unsupported_task_parameters')
             from cut_constraints import apply,export_fps_for_source,load,validate_parameter_overrides
             validate_parameter_overrides({k:v for k,v in parameters.items() if k!='cut_constraints_ref'})
             constraints_ref=parameters.get('cut_constraints_ref')
             constraint_payload=None
+            snap_overrides={}
             if constraints_ref:
                 self.ref(constraints_ref)  # Verify mounted storage identity before opening the bounded artifact.
                 probed=pipeline.probe(local)
                 constraint_payload=load(self.config['storage']['processing']['path'],constraints_ref,scratch/'feedback-snapshot.json',digest,probed['duration'],export_fps=export_fps_for_source(probed['fps']))
                 snap_overrides=constraint_payload.get('parameter_overrides') or {}
-                if any(k in parameters and parameters[k]!=v for k,v in snap_overrides.items()):
-                    raise ValueError('parameter_override_mismatch')
-                cfg.update(snap_overrides)
+                for k,v in snap_overrides.items():
+                    if k=='ai_tuning' and isinstance(v,dict) and isinstance(parameters.get('ai_tuning'),dict):
+                        for sk,sv in v.items():
+                            if sk in parameters['ai_tuning'] and parameters['ai_tuning'][sk]!=sv:
+                                raise ValueError('parameter_override_mismatch')
+                    elif k in parameters and parameters[k]!=v:
+                        raise ValueError('parameter_override_mismatch')
                 cfg['_allow_empty_analysis']=True
+
+            merged_params={k:copy.deepcopy(v) for k,v in parameters.items() if k!='cut_constraints_ref'}
+            if snap_overrides:
+                for k,v in snap_overrides.items():
+                    if k=='ai_tuning' and isinstance(v,dict):
+                        merged_params['ai_tuning']={**dict(merged_params.get('ai_tuning') or {}),**v}
+                    else:
+                        merged_params[k]=copy.deepcopy(v)
+                if snap_overrides.get('processing_strategy')=='vision_only':
+                    for ai_k in AI_PARAMETERS:
+                        merged_params.pop(ai_k,None)
+                        cfg.pop(ai_k,None)
+            effective_params=normalize_task_parameters(merged_params)
+            explicit_keys=(set(parameters)-{'cut_constraints_ref'})|set(snap_overrides)
+            cfg.update(effective_params)
+            cfg['_task_parameters']=effective_params
+            cfg['_explicit_parameter_keys']=explicit_keys
+            if effective_params.get('processing_strategy')=='hybrid_ai_vision':
+                cfg['_defer_empty_check']=True
 
             def prepare():
                 meta,proxy=pipeline.prepare_video(local,scratch,cfg)
@@ -268,6 +313,10 @@ class Agent:
                     findings['cut_constraints']={'schema_version':1,'snapshot_sha256':constraints_ref['sha256'],'base_video_version_id':constraint_payload['base_video_version_id'],
                                                 'base_attempt_id':constraint_payload['base_attempt_id'],'commands':{k:len(v) for k,v in constraint_payload['confirmed_commands'].items()},'applied_after_padding_and_merging':True,
                                                 **assembly_findings}
+                if not intervals and effective_params.get('processing_strategy')=='hybrid_ai_vision':
+                    if task.get('publication_policy','never')=='if_no_active_result':
+                        raise ProcessingTaskError('no_play_detected_after_ai_filter','AI filter retained zero play clips; original preserved.',retryable=False)
+                    cfg['_allow_empty_analysis']=True
                 return pipeline.render_session(local,out,cfg,digest,source.name,intervals,findings,meta)
             report=stage('process',process,lambda:list(out.rglob('*')))
             timing.info['clips']=report['clips']
@@ -293,6 +342,8 @@ class Agent:
                 out_findings={'clips':report['clips'],'kept_seconds':report['kept_seconds']}
                 if isinstance(report.get('analysis'),dict) and 'cut_constraints' in report['analysis']:
                     out_findings['cut_constraints']=report['analysis']['cut_constraints']
+                if isinstance(report.get('analysis'),dict) and 'ai_refinement' in report['analysis']:
+                    out_findings['ai_refinement']=report['analysis']['ai_refinement']
                 return out_findings
             # Attempt IDs differ after retries; always refresh manifest packaging.
             cache_data['stages'].pop('package_result',None)
@@ -316,7 +367,10 @@ class Agent:
             self.state.pop('pending_completion',None)
         except Exception as exc:
             LOG.exception('Attempt stopped')
-            payload={'task_id':task['id'],'attempt_id':attempt['id'],'lease_token':attempt['lease_token'],'final_event_sequence':self.state.get('event_sequence',0),'error_code':'cancelled' if isinstance(exc,Cancelled) else 'lease_lost' if isinstance(exc,LeaseLost) else 'processing_failed','retryable':isinstance(exc,OSError),'timing':timing.report('failed')}
+            err_code='cancelled' if isinstance(exc,Cancelled) else 'lease_lost' if isinstance(exc,LeaseLost) else exc.error_code if isinstance(exc,ProcessingTaskError) else 'processing_failed'
+            retryable=exc.retryable if isinstance(exc,ProcessingTaskError) else isinstance(exc,OSError)
+            err_msg=exc.message if isinstance(exc,ProcessingTaskError) else sanitize_error_message(str(exc))
+            payload={'task_id':task['id'],'attempt_id':attempt['id'],'lease_token':attempt['lease_token'],'final_event_sequence':self.state.get('event_sequence',0),'error_code':err_code,'retryable':retryable,'message':err_msg,'timing':timing.report('failed')}
             try: self.api.call('/attempts/'+attempt['id']+'/fail',payload,key=attempt['id']+'-fail')
             except (OSError,APIError): LOG.warning('Failure report unacknowledged; server lease expiry handles recovery')
         finally:

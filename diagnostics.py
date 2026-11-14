@@ -131,6 +131,7 @@ def build_extraction_provenance(
     model_sha256: str | None = None,
     extractor_code_digest: str | None = None,
     cache_reuse: dict | None = None,
+    detector_version: str = "practice-pose-v1",
 ) -> tuple[str, dict]:
     if not isinstance(source_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", source_sha256):
         raise ValueError("Invalid source_sha256 for diagnostics provenance")
@@ -252,7 +253,7 @@ def build_extraction_provenance(
         },
         "software": {
             "pipeline_version": "2.0.0",
-            "detector_version": "practice-pose-v1",
+            "detector_version": str(detector_version or "practice-pose-v1"),
             "generator_kind": GENERATOR_KIND,
             "extractor_code_digest": code_digest,
             "module_digests": module_digests,
@@ -1149,6 +1150,7 @@ def build_heuristic_diagnostics(
         model_sha256=model_sha256,
         extractor_code_digest=extractor_code_digest,
         cache_reuse=cache_reuse,
+        detector_version=str(analysis.get("detector") or "practice-pose-v1"),
     )
 
     source_duration_ms = max(1, int(round(float(duration_seconds) * 1000)))

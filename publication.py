@@ -34,6 +34,8 @@ def public_session(report, playback, media_directory=None):
     artifacts = ["edit-timeline.csv", "edit-timeline.json", "timestamps.csv", "Review.html"]
     if report.get("heuristic_diagnostics") == "heuristic-diagnostics.json":
         artifacts.append("heuristic-diagnostics.json")
+    if report.get("ai_provenance") == "ai-provenance.json":
+        artifacts.append("ai-provenance.json")
     return {"schema_version": 1, "id": digest, "title": Path(report["source"]).stem,
             "source": {"name": Path(report["source"]).name, "sha256": digest,
                        "recorded_at": source.get("recorded_at", ""), "duration_seconds": source["duration"],
@@ -64,6 +66,8 @@ def metadata_for_session(session):
     report = json.loads((session / "session.json").read_text())
     if (session / "heuristic-diagnostics.json").is_file() and "heuristic_diagnostics" not in report:
         report["heuristic_diagnostics"] = "heuristic-diagnostics.json"
+    if (session / "ai-provenance.json").is_file() and "ai_provenance" not in report:
+        report["ai_provenance"] = "ai-provenance.json"
     playback = report.get("playback") or build_playback(session, report["intervals"])
     return report, public_session(report, playback)
 

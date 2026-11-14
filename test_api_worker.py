@@ -231,3 +231,139 @@ def test_worker_execute_omits_subframe_detector_remainder_and_records_findings(t
     assert cc['export_fps']==30 and cc['min_frame_duration_ms']==33.333
     assert cc['omitted_subframe_count']==1
     assert cc['omitted_subframe_remainders_ms']==[{'start_ms':19980,'end_ms':20000,'duration_ms':20,'reason':'subframe_detector_remainder_omitted'}]
+
+
+def test_worker_ai_advertisement_snapshot_merge_and_zero_clip_policies(tmp_path,monkeypatch):
+    import api_worker,pipeline
+    from cut_constraints import version_id
+    roots={name:{'path':str(tmp_path/name)} for name in ('originals','processing')}
+    for r in roots.values():Path(r['path']).mkdir()
+    source=Path(roots['originals']['path'])/'clip.mov';source.write_bytes(b'synthetic-video-bytes')
+    sha=hashlib.sha256(source.read_bytes()).hexdigest();stat=source.stat()
+    calls=[]
+    def call(self,path,body=None,**kwargs):
+        calls.append((path,body))
+        if path.endswith('/register'):return {'worker_id':'w1','worker_token':'tok'}
+        if path.endswith('/heartbeat'):return {'lease_expires_at':9999999999,'server_time':100,'cancel':False}
+        if path.endswith('/events'):return {'acknowledged_sequence':body['events'][-1]['sequence']}
+        return {}
+    monkeypatch.setattr(api_worker.API,'call',call)
+    meta={'duration':30.0,'fps':30.0,'width':160,'height':90,'transfer':1,'recorded_at':'2026-01-01T00:00:00Z','original_metadata':{'container_tags':{'make':'Apple'}}}
+    monkeypatch.setattr(pipeline,'probe',lambda p:meta)
+    def fake_prepare(src,scratch,cfg):
+        (scratch/'analysis.mp4').write_bytes(b'proxy')
+        return meta,scratch/'analysis.mp4'
+    monkeypatch.setattr(pipeline,'prepare_video',fake_prepare)
+    monkeypatch.setattr(pipeline,'export_profile',lambda m:('',[],{'fixture':True}))
+
+    worker_cfg={
+        'state_dir':str(tmp_path/'worker'),
+        'name':'AIWorker',
+        'storage':roots,
+        'processor':{},
+        'ai':{'enabled':True,'providers':['gemini'],'gemini_api_key':'AIzaSyntheticWorkerKey123','gemini_models':['gemini-2.5-flash'],'default_model':'gemini:gemini-2.5-flash'},
+    }
+    worker=api_worker.Agent(worker_cfg)
+    reg_body=calls[0][1]
+    assert 'hybrid-ai-vision-v1' in reg_body['capabilities']
+    assert reg_body['ai_providers']==['gemini']
+    assert reg_body['default_ai_model']=='gemini:gemini-2.5-flash'
+    assert [m['id'] for m in reg_body['ai_models']]==['gemini:gemini-2.5-flash']
+    worker.heartbeat()
+    hb_body=calls[-1][1]
+    assert hb_body['default_ai_model']=='gemini:gemini-2.5-flash'
+
+    # 1. ai_only rejected via /fail with unsupported_processing_strategy
+    worker.execute({
+        'task':{'id':'t_ai_only','type':'process','input':{'storage_id':'originals','path':'clip.mov','bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':sha},
+                'parameters':{'processing_strategy':'ai_only'}},
+        'attempt':{'id':'a_ai_only','number':1,'lease_token':'lt','lease_expires_at':9999999999,'output_prefix':{'storage_id':'processing','path':'runs/t_ai_only/a_ai_only'}},
+    })
+    assert calls[-1][0]=='/attempts/a_ai_only/fail'
+    assert calls[-1][1]['error_code']=='unsupported_processing_strategy' and calls[-1][1]['retryable'] is False
+
+    # 2. Nested ai_tuning snapshot merge succeeds and propagates merged tuning into analyze_video
+    observed_cfg={}
+    base={'id':sha,'published_at':1000.0,'processing':{'attempt_id':'b'*32},'source':{'sha256':sha,'duration_seconds':30},'clips':[{'id':'base','original_start_seconds':10,'original_end_seconds':20}]}
+    snap={'schema_version':1,'compiler_version':'cut-constraints-compiler-v1','source_sha256':sha,'base_attempt_id':'b'*32,'base_video_version_id':version_id(sha,1000.0),'base_manifest':base,
+          'parameter_overrides':{'processing_strategy':'hybrid_ai_vision','ai_tuning':{'aggressiveness':'aggressive'}},
+          'selected_evidence_revisions':[{'annotation_id':'rev','version':1,'kind':'cut_feedback','context':{'publication':1000.0}}],
+          'confirmed_commands':{'keep_intervals_ms':[],'exclude_intervals_ms':[{'start_ms':0,'end_ms':1000,'source_annotation_id':'rev','source_revision':1}],'override_clip_bounds_ms':[]}}
+    raw=json.dumps(snap,sort_keys=True,separators=(',',':')).encode();snap_sha=hashlib.sha256(raw).hexdigest()
+    snap_rel=f'snapshots/{sha}/{snap_sha}.json';snap_path=Path(roots['processing']['path'])/snap_rel;snap_path.parent.mkdir(parents=True);snap_path.write_bytes(raw)
+
+    def empty_hybrid_analyze(proxy,m,cfg):
+        observed_cfg.update({'ai_tuning':cfg.get('_task_parameters',{}).get('ai_tuning')})
+        return [],{'detector':'hybrid-ai-vision-v1','target_visible_fraction':1.0,'ai_refinement':{'actual_ai_model':None,'candidate_count':0,'batch_count_total':0,'batch_provenance':[],'attempted_models':[]},'_ai_provenance_payload':{'candidate_decisions':[],'batch_provenance':[]}}
+
+    monkeypatch.setattr(pipeline,'analyze_video',empty_hybrid_analyze)
+    # 2a. Conflicting nested aggressiveness fails
+    worker.execute({
+        'task':{'id':'t_conflict','type':'process','publication_policy':'never','input':{'storage_id':'originals','path':'clip.mov','bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':sha},
+                'parameters':{'cut_constraints_ref':{'storage_id':'processing','path':snap_rel,'sha256':snap_sha,'bytes':len(raw)},'processing_strategy':'hybrid_ai_vision','ai_tuning':{'aggressiveness':'conservative'}}},
+        'attempt':{'id':'a_conflict','number':1,'lease_token':'lt','lease_expires_at':9999999999,'output_prefix':{'storage_id':'processing','path':'runs/t_conflict/a_conflict'}},
+    })
+    assert calls[-1][0]=='/attempts/a_conflict/fail' and 'parameter_override_mismatch' in calls[-1][1]['message']
+
+    # 2b. Disjoint accuracy_tier merges cleanly under publication_policy='never' with empty clips and ai-provenance.json
+    worker.execute({
+        'task':{'id':'t_merge_never','type':'process','publication_policy':'never','input':{'storage_id':'originals','path':'clip.mov','bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':sha},
+                'parameters':{'cut_constraints_ref':{'storage_id':'processing','path':snap_rel,'sha256':snap_sha,'bytes':len(raw)},'processing_strategy':'hybrid_ai_vision','ai_tuning':{'accuracy_tier':'thorough'}}},
+        'attempt':{'id':'a_merge_never','number':1,'lease_token':'lt','lease_expires_at':9999999999,'output_prefix':{'storage_id':'processing','path':'runs/t_merge_never/a_merge_never'}},
+    })
+    assert observed_cfg['ai_tuning']=={'aggressiveness':'aggressive','accuracy_tier':'thorough'}
+    assert calls[-1][0]=='/attempts/a_merge_never/complete'
+    uploaded_dir=Path(roots['processing']['path'])/'runs/t_merge_never/a_merge_never'
+    result_manifest=json.loads((uploaded_dir/'result.json').read_text())
+    assert 'ai-provenance.json' in result_manifest['session']['artifacts']
+    assert (uploaded_dir/'metadata/ai-provenance.json').is_file()
+
+    # 3. publication_policy='if_no_active_result' with zero post-AI intervals fails with no_play_detected_after_ai_filter
+    worker.execute({
+        'task':{'id':'t_auto_empty','type':'process','publication_policy':'if_no_active_result','input':{'storage_id':'originals','path':'clip.mov','bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':sha},
+                'parameters':{'processing_strategy':'hybrid_ai_vision'}},
+        'attempt':{'id':'a_auto_empty','number':1,'lease_token':'lt','lease_expires_at':9999999999,'output_prefix':{'storage_id':'processing','path':'runs/t_auto_empty/a_auto_empty'}},
+    })
+    assert calls[-1][0]=='/attempts/a_auto_empty/fail'
+    assert calls[-1][1]['error_code']=='no_play_detected_after_ai_filter' and calls[-1][1]['retryable'] is False
+
+
+def test_worker_fail_payload_redacts_secrets_and_paths(tmp_path,monkeypatch):
+    import api_worker,pipeline
+    from hybrid_ai import ProcessingTaskError
+    roots={name:{'path':str(tmp_path/name)} for name in ('originals','processing')}
+    for r in roots.values():Path(r['path']).mkdir()
+    source=Path(roots['originals']['path'])/'clip.mov';source.write_bytes(b'synthetic-video-bytes')
+    sha=hashlib.sha256(source.read_bytes()).hexdigest();stat=source.stat()
+    calls=[]
+    def call(self,path,body=None,**kwargs):
+        calls.append((path,body))
+        if path.endswith('/register'):return {'worker_id':'w1','worker_token':'tok'}
+        if path.endswith('/heartbeat'):return {'lease_expires_at':9999999999,'server_time':100,'cancel':False}
+        if path.endswith('/events'):return {'acknowledged_sequence':body['events'][-1]['sequence']}
+        return {}
+    monkeypatch.setattr(api_worker.API,'call',call)
+    meta={'duration':10.0,'fps':30.0,'width':160,'height':90,'transfer':1,'recorded_at':'2026-01-01T00:00:00Z','original_metadata':{}}
+    monkeypatch.setattr(pipeline,'probe',lambda p:meta)
+    def fake_prepare(src,scratch,cfg):
+        (scratch/'analysis.mp4').write_bytes(b'p')
+        return meta,scratch/'analysis.mp4'
+    monkeypatch.setattr(pipeline,'prepare_video',fake_prepare)
+    def leaky_analyze(*args,**kwargs):
+        raise ProcessingTaskError(
+            'ai_provider_failed',
+            'Failed calling https://api.example/v1?key=secret999 with Authorization Bearer TopSecretToken999 key=AIzaLeakyKey123456 at /private/sample/secret.json',
+            retryable=False,
+        )
+    monkeypatch.setattr(pipeline,'analyze_video',leaky_analyze)
+    worker=api_worker.Agent({'state_dir':str(tmp_path/'worker'),'name':'Test','storage':roots,'processor':{}})
+    worker.execute({
+        'task':{'id':'t_redact','type':'dryrun','input':{'storage_id':'originals','path':'clip.mov','bytes':stat.st_size,'modified_ns':stat.st_mtime_ns,'sha256':sha},
+                'parameters':{'processing_strategy':'hybrid_ai_vision'}},
+        'attempt':{'id':'a_redact','number':1,'lease_token':'lt','lease_expires_at':9999999999,'output_prefix':{'storage_id':'processing','path':'runs/t_redact/a_redact'}},
+    })
+    assert calls[-1][0]=='/attempts/a_redact/fail'
+    assert calls[-1][1]['error_code']=='ai_provider_failed'
+    msg=calls[-1][1]['message']
+    for secret in ('AIzaLeakyKey123456','TopSecretToken999','secret999','/private/sample/secret.json'):
+        assert secret not in msg

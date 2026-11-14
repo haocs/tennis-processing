@@ -5,10 +5,12 @@ import math
 from pathlib import Path,PurePosixPath
 import re
 
+from hybrid_ai import PARAMETERS as HYBRID_PARAMETERS, validate_task_parameters
+
 MAX_BYTES=256*1024
 CAPABILITY='cut-constraints-v1'
 KINDS={'keep_intervals_ms','exclude_intervals_ms','override_clip_bounds_ms'}
-PARAMETERS={'target_region','min_player_height','swing_speed','arm_reach','padding_before','padding_after','merge_gap'}
+PARAMETERS=set(HYBRID_PARAMETERS)
 
 
 def version_id(source,publication):
@@ -34,16 +36,7 @@ def min_frame_duration_ms(export_fps=None,min_duration_ms=None):
 
 
 def validate_parameter_overrides(parameters):
-    if not isinstance(parameters,dict) or set(parameters)-PARAMETERS:
-        raise ValueError('invalid_parameter_overrides')
-    for key,value in parameters.items():
-        if key=='target_region':
-            if (not isinstance(value,list) or len(value)!=4
-                or any(type(v) not in (float,int) or not math.isfinite(v) or not 0<=v<=1 for v in value)
-                or not value[0]<value[2] or not value[1]<value[3]):
-                raise ValueError('invalid_parameter_overrides')
-        elif type(value) not in (int,float) or not math.isfinite(value) or value<0 or value>10000:
-            raise ValueError('invalid_parameter_overrides')
+    validate_task_parameters(parameters)
     return parameters
 
 

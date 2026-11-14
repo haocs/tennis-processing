@@ -143,6 +143,15 @@ combines and verifies them. Completed stages retain validated local checkpoints;
 algorithm/config/source changes invalidate their fingerprint. Process currently
 resumes at whole-stage boundaries, not individual clips (follow-up).
 
+Optional hybrid AI filtering (`processing_strategy: "hybrid_ai_vision"`) can be
+enabled per task when the worker configures `"ai": {"enabled": true, ...}` in
+`api-worker.json`. The worker advertises discovered models from configured local
+providers (`antigravity`, `gemini`, `codex`) and honors per-task `ai_model`,
+`allow_model_fallback`, and `ai_tuning` overrides, emitting `ai-provenance.json`
+without uploading raw frames or prompts. Raw pose outputs cache locally under
+`<state_dir>/cache/pose` while per-task `pose-observations.json` and AI decisions
+recompute cleanly when tuning parameters change.
+
 Dryrun creates real local media and sends findings/timing through the API; it
 uploads no result/media/checkpoint files to NAS. Experiment tasks isolate the same
 executor with parameter changes; training/evaluation executors are future work.

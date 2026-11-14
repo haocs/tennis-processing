@@ -17,5 +17,13 @@
     "padding_before": 2.0,
     "padding_after": 1.5,
     "merge_gap": 0.5
+  },
+  "ai": {
+    "enabled": false,
+    "providers": ["antigravity", "gemini", "codex"],
+    "default_model": "antigravity:gemini-3-flash-low",
+    "fallback_models": ["gemini:gemini-2.5-flash"],
+    "gemini_api_key_env": "GEMINI_API_KEY",
+    "request_timeout_seconds": 180
   }
 }

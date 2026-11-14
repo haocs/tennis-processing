@@ -68,3 +68,15 @@ Commands run after detector padding and merging. Overrides replace the union of 
 The common video-version ID is `v_` plus the first 32 hex characters of SHA256(compact JSON `[source_sha256, float(published_at)]`). A separate descriptor digest is provenance, not the version identity. Public metadata checksums cover the frozen diagnostics artifact.
 
 Constraint overrides must overlap their own base clip and cannot overlap another base clip; use confirmed keep/exclude ranges for edits spanning multiple cuts. Confirmed keep/override intervals shorter than an export frame fail before rendering. Unforced detector remnants shorter than an export frame are omitted with assembly findings; excludes are never restored. Export-frame size follows the existing 30/60fps export choice. Capability synchronization retries after an older/offline server, and the supervisor retries transient HTTP failures without treating authentication errors as new-worker registration.
+
+## Processing strategies and Hybrid AI provenance
+
+Tasks accept `parameters.processing_strategy`:
+- `vision_only` (default): local pose detector and heuristic assembly only (`AI` parameters forbidden).
+- `hybrid_ai_vision`: local pose extraction (`YOLOv8n-pose` raw records cached separately from per-task `pose-observations.json`) followed by bounded `<= 45.0s` contact-sheet inspection using per-task `ai_model`, `allow_model_fallback`, and `ai_tuning` (`aggressiveness`: `conservative|balanced|aggressive`, `accuracy_tier`: `fast|standard|thorough`).
+- `ai_only`: reserved pure-AI strategy; rejected today with `unsupported_processing_strategy`.
+
+When `hybrid_ai_vision` runs:
+- Workers with AI enabled advertise `hybrid-ai-vision-v1` alongside discovered `ai_providers`, `ai_models`, and `default_ai_model`.
+- Workers emit untruncated `ai-provenance.json` inside public session `artifacts` (verified by `metadata_checksums` and `output_checksums`) containing `schema_sha256`, per-batch `prompt_sha256` / `input_manifest_sha256`, `actual_ai_model` (`null`, `<provider>:<model>`, or `"mixed"`), `fallback_used`, and full `candidate_decisions`.
+- Completion `findings.ai_refinement` mirrors a `<= 32 KiB` bounded summary referencing `provenance_artifact` (`"ai-provenance.json"`) and `provenance_sha256` so `/complete` requests remain small while full auditability stays in public metadata. Raw JPEG sheets and prompts remain local to ephemeral worker scratch directories and are never uploaded.

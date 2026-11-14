@@ -87,7 +87,38 @@ def score_poses(records, cfg, width, height):
     return events, visible / max(1, len(records))
 
 
-def detect(video, cfg):
+def records_to_jsonable(records):
+    """Convert raw numpy pose records to a JSON-serializable list preserving frame fields."""
+    out = []
+    for r in records:
+        out.append({
+            "t": round(float(r["t"]), 6),
+            "b": np.asarray(r["boxes"], dtype=np.float32).tolist(),
+            "k": np.asarray(r["k"], dtype=np.float32).tolist(),
+            "kc": np.asarray(r["kc"], dtype=np.float32).tolist(),
+        })
+    return out
+
+
+def records_from_jsonable(raw_records):
+    """Restore raw pose records with deterministic empty numpy array shapes."""
+    records = []
+    for r in raw_records:
+        boxes = np.asarray(r["b"], dtype=np.float32)
+        if boxes.size == 0:
+            boxes = boxes.reshape((0, 4))
+        kp = np.asarray(r["k"], dtype=np.float32)
+        if kp.size == 0:
+            kp = kp.reshape((0, 17, 2))
+        kc = np.asarray(r["kc"], dtype=np.float32)
+        if kc.size == 0:
+            kc = kc.reshape((0, 17))
+        records.append({"t": float(r["t"]), "boxes": boxes, "k": kp, "kc": kc})
+    return records
+
+
+def extract_pose_records(video, cfg):
+    """Run raw pose inference across every frame of the analysis proxy."""
     source = Path(cfg["rallyclip_path"])
     sys.path.insert(0, str(source / "src"))
     from extraction.pose_extractor import PoseExtractor
@@ -109,8 +140,6 @@ def detect(video, cfg):
                 LOG.info("Analyzing %.0f / %.0f seconds", frame.time, duration)
                 progress(cfg, "Analyzing player movement", round(float(frame.time), 1), round(duration, 1), "video seconds")
                 last_log = time.monotonic()
-    events, visibility = score_poses(records, cfg, width, height)
-    from diagnostics import extract_frame_observations, save_local_observations
     proxy_meta = {
         "width": width,
         "height": height,
@@ -119,9 +148,29 @@ def detect(video, cfg):
         "pts_timebase": pts_timebase,
         "frame_count": len(records),
     }
-    observations = extract_frame_observations(records, cfg, width, height, events=events)
-    save_local_observations(Path(video).parent / "pose-observations.json", observations, proxy_meta=proxy_meta)
+    return records, proxy_meta, duration
+
+
+def detect_from_records(records, proxy_meta, duration, cfg, observations_path=None):
+    """Score raw pose records, write derived observations, and merge motion intervals."""
+    width = int(proxy_meta["width"])
+    height = int(proxy_meta["height"])
+    events, visibility = score_poses(records, cfg, width, height)
+    if observations_path is not None:
+        from diagnostics import extract_frame_observations, save_local_observations
+        observations = extract_frame_observations(records, cfg, width, height, events=events)
+        save_local_observations(Path(observations_path), observations, proxy_meta=proxy_meta)
     intervals = merge_intervals(events, duration, cfg.get("padding_before", 2.0), cfg.get("padding_after", 1.5), cfg.get("merge_gap", 0.5))
-    return intervals, {"detector": VERSION, "target_visible_fraction": round(visibility, 3), "motion_events": len(events), "event_intervals": events,
-                       "proxy_observation_meta": proxy_meta,
-                       "note": "Candidate practice activity based on near-player pose motion. May include shadow swings or walking and miss obscured/slow strokes. Original is preserved."}
+    return intervals, {
+        "detector": VERSION,
+        "target_visible_fraction": round(visibility, 3),
+        "motion_events": len(events),
+        "event_intervals": events,
+        "proxy_observation_meta": proxy_meta,
+        "note": "Candidate practice activity based on near-player pose motion. May include shadow swings or walking and miss obscured/slow strokes. Original is preserved.",
+    }
+
+
+def detect(video, cfg):
+    records, proxy_meta, duration = extract_pose_records(video, cfg)
+    return detect_from_records(records, proxy_meta, duration, cfg, observations_path=Path(video).parent / "pose-observations.json")

@@ -495,10 +495,10 @@ def test_runtime_build_digest_includes_diagnostics_and_legacy_outputs_remain_val
     )
     assert worker.validate_publication(legacy_dir, "a" * 64)
 
-    # Verify api_worker build_digest hashes diagnostics.py and publication.py
+    # Verify api_worker build_digest hashes diagnostics.py, hybrid_ai.py and publication.py
     expected = hashlib.sha256()
     root = Path(api_worker.__file__).parent
-    for name in ("api_worker.py", "pipeline.py", "detector.py", "cut_constraints.py", "diagnostics.py", "publication.py", "color.py", "playback.py", "timeline.py"):
+    for name in ("api_worker.py", "pipeline.py", "detector.py", "hybrid_ai.py", "cut_constraints.py", "diagnostics.py", "publication.py", "color.py", "playback.py", "timeline.py"):
         expected.update((root / name).read_bytes())
     state_dir = tmp_path / "wstate"
     state_dir.mkdir()
