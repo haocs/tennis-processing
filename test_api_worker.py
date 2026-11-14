@@ -383,3 +383,95 @@ def test_disabled_ai_explicitly_clears_model_advertisements(tmp_path, monkeypatc
         assert body['ai_models'] == [] and body['ai_providers'] == []
         assert body['default_ai_model'] is None
         assert 'hybrid-ai-vision-v1' not in body['capabilities']
+
+
+def test_worker_cleanup_preserves_active_task_and_cache(tmp_path, monkeypatch):
+    import api_worker
+    calls = []
+    cleanup_seq = {'value': 0}
+
+    def call(self, path, body=None, **kwargs):
+        calls.append((path, body))
+        if path.endswith('/register'):
+            return {'worker_id': 'w1', 'worker_token': 'tok'}
+        if path.endswith('/heartbeat'):
+            return {
+                'lease_expires_at': 9999999999,
+                'server_time': 100,
+                'cancel': False,
+                'cleanup_requested_sequence': cleanup_seq['value'],
+            }
+        return {}
+
+    monkeypatch.setattr(api_worker.API, 'call', call)
+    state_dir = tmp_path / 'worker-state'
+    done_dir = state_dir / 'tasks' / 't_done'
+    (done_dir / 'result').mkdir(parents=True)
+    (done_dir / 'bundle').mkdir(parents=True)
+    done_file = done_dir / 'result' / 'clip.mp4'
+    done_file.write_bytes(b'A' * 120)
+    # Hardlink duplicate inside bundle must count once in scratch_usage and be freed cleanly.
+    import os
+    os.link(done_file, done_dir / 'bundle' / 'clip.mp4')
+    active_dir = state_dir / 'tasks' / 't_active'
+    active_dir.mkdir(parents=True)
+    (active_dir / 'source.mov').write_bytes(b'B' * 50)
+    cache_file = state_dir / 'cache' / 'pose.json'
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_bytes(b'C' * 30)
+
+    agent = api_worker.Agent({'name': 'Cleaner', 'state_dir': str(state_dir), 'storage': {'originals': {'path': str(tmp_path)}}, 'processor': {}})
+    assert agent.profile['worker_version'] == '2.2.0'
+    agent.assignment = {'task': {'id': 't_active'}, 'attempt': {'id': 'a1', 'lease_token': 'lt'}}
+
+    # Request sequence 1 while t_active is running.
+    cleanup_seq['value'] = 1
+    agent.heartbeat()
+
+    heartbeats = [body for path, body in calls if path.endswith('/heartbeat')]
+    assert len(heartbeats) == 2
+    assert heartbeats[0]['scratch'] == {
+        'tasks_bytes': 170,
+        'cleanable_bytes': 120,
+        'task_count': 2,
+        'cleanable_count': 1,
+        'cache_bytes': 30,
+    }
+    assert heartbeats[0]['worker_version'] == '2.2.0'
+    assert not done_dir.exists()
+    assert active_dir.is_dir()
+    assert cache_file.is_file()
+    assert heartbeats[1]['last_cleanup']['sequence'] == 1
+    assert heartbeats[1]['last_cleanup']['removed_tasks'] == 1
+    assert heartbeats[1]['last_cleanup']['freed_bytes'] == 120
+    assert heartbeats[1]['last_cleanup']['errors'] == 0
+    assert heartbeats[1]['scratch'] == {
+        'tasks_bytes': 50,
+        'cleanable_bytes': 0,
+        'task_count': 1,
+        'cleanable_count': 0,
+        'cache_bytes': 30,
+    }
+
+    # Same requested sequence does not re-run or emit duplicate confirmation heartbeats.
+    agent.heartbeat()
+    assert len([body for path, body in calls if path.endswith('/heartbeat')]) == 3
+
+    # Clear active task and advance request sequence to 2 -> t_active is now cleaned up.
+    agent.assignment = None
+    cleanup_seq['value'] = 2
+    agent.heartbeat()
+    heartbeats = [body for path, body in calls if path.endswith('/heartbeat')]
+    assert len(heartbeats) == 5
+    assert not active_dir.exists()
+    assert cache_file.is_file()
+    assert heartbeats[-1]['last_cleanup']['sequence'] == 2
+    assert heartbeats[-1]['last_cleanup']['removed_tasks'] == 1
+    assert heartbeats[-1]['last_cleanup']['freed_bytes'] == 50
+    assert heartbeats[-1]['scratch'] == {
+        'tasks_bytes': 0,
+        'cleanable_bytes': 0,
+        'task_count': 0,
+        'cleanable_count': 0,
+        'cache_bytes': 30,
+    }

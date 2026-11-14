@@ -70,11 +70,38 @@ class LeaseLost(RuntimeError): pass
 class Cancelled(RuntimeError): pass
 
 
+def _tree_bytes(path,seen=None):
+    total=0
+    if seen is None:seen=set()
+    root=Path(path)
+    if not root.exists():return 0
+    stack=[root]
+    while stack:
+        current=stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_symlink():continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            st=entry.stat(follow_symlinks=False)
+                            key=(st.st_dev,st.st_ino)
+                            if key not in seen:
+                                seen.add(key);total+=st.st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
 class Agent:
     def __init__(self,config):
         self.config=config;self.root=Path(config['state_dir']);self.root.mkdir(parents=True,exist_ok=True)
         self.state_path=self.root/'worker.json';self.state=json.loads(self.state_path.read_text()) if self.state_path.exists() else {}
-        self.api=API(config,self.state);self.lock=threading.RLock();self.assignment=None;self.last_progress=0;self.failed=None;self.stop=threading.Event();self.next_heartbeat=0
+        self.api=API(config,self.state);self.lock=threading.RLock();self.cleanup_lock=threading.Lock();self.assignment=None;self.last_progress=0;self.failed=None;self.stop=threading.Event();self.next_heartbeat=0
         self.sequence=self.state.get('sequence',0);self.pending=None;self.deadline=None
         code=hashlib.sha256()
         for name in ('api_worker.py','pipeline.py','detector.py','hybrid_ai.py','cut_constraints.py','diagnostics.py','publication.py','color.py','playback.py','timeline.py'):
@@ -85,7 +112,7 @@ class Agent:
         import platform
         self.ai_profile=discover_worker_ai_profile(config)
         capabilities=['process-v2','cut-constraints-v1','heuristic-diagnostics-v1']+list(self.ai_profile.get('capabilities_extra',[]))
-        self.profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.1.0','capabilities':capabilities,'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
+        self.profile={'display_name':config['name'],'platform':platform.system().lower(),'worker_version':'2.2.0','capabilities':capabilities,'accessible_storage_ids':list(config['storage']),'runtime':self.runtime}
         # Explicit empty fields remove obsolete model advertisements when AI is disabled.
         self.profile['ai_providers']=list(self.ai_profile.get('ai_providers') or [])
         self.profile['ai_models']=list(self.ai_profile.get('ai_models') or [])
@@ -137,19 +164,85 @@ class Agent:
         if not path.is_relative_to(root) or path==root: raise ValueError('invalid_storage_path')
         return path
 
+    def _protected_task_ids(self):
+        with self.lock:
+            ids=set()
+            for candidate in (self.assignment,self.state.get('active')):
+                if isinstance(candidate,dict):
+                    tid=candidate.get('task',{}).get('id')
+                    if isinstance(tid,str) and tid:ids.add(tid)
+            for key in ('pending_completion','pending_event'):
+                item=self.state.get(key)
+                if isinstance(item,dict):
+                    tid=item.get('task_id')
+                    if isinstance(tid,str) and tid:ids.add(tid)
+            return ids
+
+    def scratch_usage(self):
+        tasks_dir=self.root/'tasks'
+        cache_dir=self.root/'cache'
+        protected=self._protected_task_ids()
+        tasks_bytes=0;cleanable_bytes=0;task_count=0;cleanable_count=0;seen=set()
+        if tasks_dir.is_dir():
+            for entry in tasks_dir.iterdir():
+                if entry.is_symlink():continue
+                if entry.is_dir():
+                    task_count+=1
+                    size=_tree_bytes(entry,seen)
+                    tasks_bytes+=size
+                    if entry.name not in protected:
+                        cleanable_bytes+=size;cleanable_count+=1
+                elif entry.is_file():
+                    try:
+                        st=entry.stat()
+                        key=(st.st_dev,st.st_ino)
+                        if key not in seen:
+                            seen.add(key);tasks_bytes+=st.st_size;cleanable_bytes+=st.st_size
+                    except OSError:
+                        pass
+        cache_bytes=_tree_bytes(cache_dir) if cache_dir.is_dir() else 0
+        return {'tasks_bytes':tasks_bytes,'cleanable_bytes':cleanable_bytes,'task_count':task_count,'cleanable_count':cleanable_count,'cache_bytes':cache_bytes}
+
+    def cleanup_processed_tasks(self,requested_sequence=None):
+        with self.cleanup_lock:
+            tasks_dir=self.root/'tasks'
+            removed_tasks=0;freed_bytes=0;errors=0
+            if tasks_dir.is_dir():
+                for entry in list(tasks_dir.iterdir()):
+                    if entry.is_symlink():continue
+                    if entry.name in self._protected_task_ids():continue
+                    try:
+                        size=_tree_bytes(entry) if entry.is_dir() else entry.stat().st_size
+                        if entry.is_dir():
+                            shutil.rmtree(entry);removed_tasks+=1;freed_bytes+=size
+                        elif entry.is_file():
+                            entry.unlink();freed_bytes+=size
+                    except OSError:
+                        errors+=1
+            summary={'sequence':int(requested_sequence or 0),'completed_at':int(time.time()),'removed_tasks':removed_tasks,'freed_bytes':freed_bytes,'errors':errors}
+            with self.lock:
+                self.state['last_cleanup']=summary
+                self.persist()
+            return summary
+
     def persist(self):
         with self.lock:
             self.state['sequence']=self.sequence
             self.state['active']=self.assignment
             atomic(self.state_path,self.state)
 
-    def heartbeat(self):
+    def heartbeat(self,allow_cleanup=True):
+        scratch=self.scratch_usage()
         with self.lock:
             if not getattr(self,'profile_synced',True):
                 self.sync_profile()
             self.sequence+=1
-            body={'sequence':self.sequence,'runtime':self.runtime,'stage':self.state.get('stage','Idle'),'last_progress_at':self.last_progress,'local_state':{'task_id':self.assignment['task']['id'] if self.assignment else None,'attempt_id':self.assignment['attempt']['id'] if self.assignment else None,'acknowledged_sequence':self.state.get('event_sequence',0)}}
+            body={'sequence':self.sequence,'runtime':self.runtime,'stage':self.state.get('stage','Idle'),'last_progress_at':self.last_progress,'scratch':scratch,'local_state':{'task_id':self.assignment['task']['id'] if self.assignment else None,'attempt_id':self.assignment['attempt']['id'] if self.assignment else None,'acknowledged_sequence':self.state.get('event_sequence',0)}}
+            if self.state.get('last_cleanup'):
+                body['last_cleanup']=self.state['last_cleanup']
             if getattr(self,'profile',None):
+                if self.profile.get('worker_version'):
+                    body['worker_version']=self.profile['worker_version']
                 body['capabilities']=list(self.profile['capabilities'])
                 body['accessible_storage_ids']=list(self.profile['accessible_storage_ids'])
                 if 'ai_models' in self.profile:
@@ -164,7 +257,15 @@ class Agent:
                 self.deadline=time.monotonic()+max(0,result['lease_expires_at']-result['server_time']-5)
                 if result.get('cancel'): self.failed=Cancelled('cancelled')
             self.persist()
-            return result
+            last_cleanup_seq=int((self.state.get('last_cleanup') or {}).get('sequence') or 0)
+        requested_cleanup_seq=int(result.get('cleanup_requested_sequence') or 0) if isinstance(result,dict) else 0
+        if allow_cleanup and requested_cleanup_seq>last_cleanup_seq:
+            self.cleanup_processed_tasks(requested_cleanup_seq)
+            try:
+                return self.heartbeat(allow_cleanup=False)
+            except Exception:
+                pass
+        return result
 
     def background(self):
         while not self.stop.wait(15):

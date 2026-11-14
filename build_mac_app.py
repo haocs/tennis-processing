@@ -41,7 +41,7 @@ def build(config):
     # User configuration is copied privately; the source checkout stays generic.
     app=Path.home()/'Applications/Tennis Worker.app';contents=app/'Contents'
     (contents/'MacOS').mkdir(parents=True,exist_ok=True);(contents/'Resources').mkdir(exist_ok=True)
-    info={'CFBundleIdentifier':'io.haocs.tennis-worker','CFBundleName':'Tennis Worker','CFBundleDisplayName':'Tennis Worker','CFBundleExecutable':'TennisWorker','CFBundlePackageType':'APPL','CFBundleVersion':'3','CFBundleShortVersionString':'2.1.0','LSMinimumSystemVersion':'14.0','CFBundleSupportedPlatforms':['MacOSX'],'LSUIElement':True,'NSPrincipalClass':'NSApplication','NSLocalNetworkUsageDescription':'Connect to your NAS processing server to receive tennis tasks and report progress. Your recordings stay on your local network.'}
+    info={'CFBundleIdentifier':'io.haocs.tennis-worker','CFBundleName':'Tennis Worker','CFBundleDisplayName':'Tennis Worker','CFBundleExecutable':'TennisWorker','CFBundlePackageType':'APPL','CFBundleVersion':'4','CFBundleShortVersionString':'2.2.0','LSMinimumSystemVersion':'14.0','CFBundleSupportedPlatforms':['MacOSX'],'LSUIElement':True,'NSPrincipalClass':'NSApplication','NSLocalNetworkUsageDescription':'Connect to your NAS processing server to receive tennis tasks and report progress. Your recordings stay on your local network.'}
     (contents/'Info.plist').write_bytes(plistlib.dumps(info))
     launch={'python':str(python),'python_home':runtime['base'],'site_packages':str(packages),'script':str(code/'api_worker.py'),'config':str(private),'directory':str(support)}
     (contents/'Resources/worker-launch.json').write_text(json.dumps(launch))
